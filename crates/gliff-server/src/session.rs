@@ -1913,7 +1913,9 @@ fn headless_cap(width: u32, height: u32) -> (u32, u32) {
 
 /// Shrink a private screen that is larger than `--max-stream`, lowering its
 /// scale by the same factor so the desktop keeps its logical size and
-/// renders at the size that is streamed.
+/// renders at the size that is streamed. The scale stops at 0.5: below
+/// that, the screen renders at scale 0.5 and the encoder scales the stream
+/// down the rest of the way (`stream_limit` includes the cap).
 fn fit_max_stream(
     width: u32,
     height: u32,
@@ -1925,12 +1927,13 @@ fn fit_max_stream(
     };
     let fit = (f64::from(max_w) / f64::from(width))
         .min(f64::from(max_h) / f64::from(height))
+        .max(0.5 / f64::from(scale))
         .min(1.0);
     if fit >= 1.0 {
         return (width, height, scale);
     }
     let shrink = |v: u32| ((f64::from(v) * fit) as u32 & !1).max(2);
-    (shrink(width), shrink(height), (scale * fit as f32).max(0.5))
+    (shrink(width), shrink(height), scale * fit as f32)
 }
 
 /// The headless mode to ask Hyprland for: the client's window within the
@@ -1983,6 +1986,21 @@ mod tests {
             (1920, 1080, 1.0)
         );
         assert_eq!(fit_max_stream(3840, 2160, 1.5, None), (3840, 2160, 1.5));
+        // A cap below half the screen at scale 1 stops the scale at 0.5, so
+        // the desktop keeps its 3840x2160 logical size. The encoder fits the
+        // 1920x1080 render into the 1280x720 cap.
+        let (w, h, s) = fit_max_stream(3840, 2160, 1.0, Some((1280, 720)));
+        assert_eq!((w, h, s), (1920, 1080, 0.5));
+        assert_eq!((w as f32 / s, h as f32 / s), (3840.0, 2160.0));
+        let caps = ClientCaps {
+            max_width: 3840,
+            max_height: 2160,
+            codecs: vec![Codec::H264],
+            chroma: vec![ChromaMode::Dual420],
+            features: vec![],
+        };
+        let limit = stream_limit((4096, 4096), &caps, Some((1280, 720))).unwrap();
+        assert_eq!(EncoderSettings::fit_extent(w, h, limit), (1280, 720));
         // A tall window is fitted by its height; the sides stay even.
         let (w, h, s) = fit_max_stream(2160, 3840, 2.0, Some((2560, 1440)));
         assert!(w % 2 == 0 && h <= 1440 && w <= 2560 && (s - 0.75).abs() < 0.01);
