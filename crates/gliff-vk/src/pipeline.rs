@@ -278,6 +278,7 @@ impl Encoder {
         force_keyframe: bool,
     ) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
+        let t0 = std::time::Instant::now();
         let (split, main, aux) = (&self.split, &self.main, self.aux.as_ref());
         // The split blocks until it is done: the encoder reads the surfaces
         // through VA-API, which knows nothing of Vulkan's fences, or on the
@@ -301,16 +302,26 @@ impl Encoder {
             })?;
         // Submit both encodes, then wait: the main stream's readback overlaps
         // the aux encode on the GPU.
+        let t_split = t0.elapsed();
         let main_pending = self.main.submit(force_keyframe)?;
         let aux_pending = match &mut self.aux {
             Some(a) => Some(a.submit(force_keyframe)?),
             None => None,
         };
+        let t_submit = t0.elapsed();
         let main = self.main.finish(main_pending)?;
+        let t_main = t0.elapsed();
         let aux = match (&mut self.aux, aux_pending) {
             (Some(a), Some(pending)) => Some(a.finish(pending)?),
             _ => None,
         };
+        tracing::debug!(
+            split_us = t_split.as_micros(),
+            submit_us = (t_submit - t_split).as_micros(),
+            main_us = (t_main - t_submit).as_micros(),
+            aux_us = (t0.elapsed() - t_main).as_micros(),
+            "encode timing"
+        );
         Ok(EncodedFrame {
             keyframe: main.keyframe,
             main: main.data,

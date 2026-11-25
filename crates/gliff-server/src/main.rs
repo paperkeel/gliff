@@ -56,6 +56,12 @@ struct Cli {
     /// server adapts below it when the link shows queueing.
     #[arg(long)]
     bitrate: Option<u32>,
+    /// Largest stream to send, as WIDTHxHEIGHT (for example 2560x1440). A
+    /// private screen is rendered at that size with its scale lowered to
+    /// match, so the desktop keeps its layout; a mirrored screen is scaled
+    /// down. Fewer pixels encode, travel and decode faster.
+    #[arg(long, value_parser = parse_size)]
+    max_stream: Option<(u32, u32)>,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
     /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
     /// the GLIFF_VIDEO environment variable.
@@ -73,6 +79,18 @@ struct Cli {
     /// GLIFF_CAPTURE environment variable.
     #[arg(long, value_parser = ["auto", "dmabuf", "shm"])]
     capture: Option<String>,
+}
+
+fn parse_size(value: &str) -> Result<(u32, u32), String> {
+    let (w, h) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected WIDTHxHEIGHT, got {value:?}"))?;
+    let parse = |v: &str| v.trim().parse::<u32>().map_err(|e| format!("{v:?}: {e}"));
+    let (w, h) = (parse(w)?, parse(h)?);
+    if w < 320 || h < 240 {
+        return Err(format!("{w}x{h} is smaller than 320x240"));
+    }
+    Ok((w, h))
 }
 
 fn main() -> Result<()> {
@@ -102,6 +120,7 @@ fn main() -> Result<()> {
         render_node,
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
+        max_stream: cli.max_stream,
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),

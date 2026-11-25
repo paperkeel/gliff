@@ -145,10 +145,14 @@ Every crate with `unsafe` documents the safety requirements at each block.
   sliding-window marking.
 
 - **Latest-wins, rate-paced.** The server keeps only the most recent captured
-  frame and encodes it on one commanded cadence: the pace timer and the
-  encoder's programmed frame rate are the same number (the ladder's fps cap,
-  bounded by the sustainable encode time), so bits per frame match the frames
-  that really leave. Sending is bounded by bytes in flight against
+  frame and encodes it on one commanded cadence: the encoder's programmed
+  frame rate is the ladder's fps cap, bounded by the sustainable encode time,
+  so bits per frame match the frames that really leave. The pace timer runs
+  5% faster than that cap (`PACE_HEADROOM`). A slot of exactly one frame
+  interval drifts against the compositor's clock. Each frame then waits for
+  its slot by up to one interval: on a 4K 60 Hz output, frames waited 7.8 ms
+  at p50 and the stream ran at 57 fps. With the headroom, a 60 Hz source
+  finds its slot open, waits 0 ms at p50, and runs at 59.5-59.9 fps. Sending is bounded by bytes in flight against
   `gain x delivered rate x base RTT` (never below two frames), not by an ack
   count, so latency does not cap the frame rate and a slow client cannot
   build a backlog. Frames are captured on demand, so a static screen costs

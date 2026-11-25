@@ -38,6 +38,8 @@ pub struct Config {
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
+    /// The largest stream to send (`--max-stream`).
+    pub max_stream: Option<(u32, u32)>,
     pub video: VideoMode,
     /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
     pub full_chroma: bool,
@@ -239,6 +241,7 @@ where
         require_shm: false,
         client_extent: (caps.max_width, caps.max_height),
         caps,
+        max_stream: cfg.max_stream,
         link: LinkEstimator::new(),
         ctl,
         codec,
@@ -246,6 +249,8 @@ where
         settings,
         encoder,
         pending: None,
+        pending_since: Instant::now(),
+        held_us: 0,
         capture_asked: true,
         blocked_noted: false,
         frame_id: 0,
@@ -440,6 +445,8 @@ struct Session {
     stream: (u32, u32),
     /// The largest size the encoder accepts.
     encoder_max: (u32, u32),
+    /// The server's stream cap (`--max-stream`).
+    max_stream: Option<(u32, u32)>,
     /// A GPU encode has succeeded, so a later failure is not a broken
     /// driver path to fall back from.
     gpu_encoded: bool,
@@ -457,14 +464,18 @@ struct Session {
     encoder: VideoEncoder,
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
+    /// When `pending` arrived from the capture thread.
+    pending_since: Instant,
+    /// How long the last encoded frame waited between capture and encode.
+    held_us: u128,
     capture_asked: bool,
     /// The pending frame has already counted as blocked for the rate
     /// controller.
     blocked_noted: bool,
     frame_id: u64,
     want_keyframe: bool,
-    /// The one commanded cadence: the pace timer and the encoder's
-    /// programmed frame rate both use it.
+    /// The one commanded cadence: the encoder's programmed frame rate, and
+    /// the pace timer with `PACE_HEADROOM` on top.
     fps_cmd: u32,
     /// Smoothed encode time, for the sustainable-fps clamp.
     encode_us: f64,
@@ -661,6 +672,7 @@ impl Session {
         if !self.output.is_headless() {
             return self.fit_mirror(width, height);
         }
+        let (width, height, scale) = fit_max_stream(width, height, scale, self.max_stream);
         let (width, height) = headless_target(width, height, scale);
         let same_size = (width, height) == (self.output.width, self.output.height);
         let same_scale = (scale - self.output.scale).abs() < 0.01;
@@ -795,6 +807,7 @@ impl Session {
                     tracing::info!(width = size.0, height = size.1, "mirrored output resized");
                 }
                 self.pending = Some(image);
+                self.pending_since = Instant::now();
                 self.capture_asked = false;
                 self.blocked_noted = false;
             }
@@ -857,6 +870,7 @@ impl Session {
         }
         if self.link_has_room() && now >= self.next_send_at {
             if let Some(frame) = self.pending.take() {
+                self.held_us = now.duration_since(self.pending_since).as_micros();
                 // A frame captured before a resize took effect is stale.
                 if self.matches_output(&frame) {
                     if self.encode_and_send(&frame, false)?.is_none() {
@@ -915,6 +929,15 @@ impl Session {
 
     fn frame_interval(&self) -> Duration {
         Duration::from_secs_f64(1.0 / self.fps_cmd.max(1) as f64)
+    }
+
+    /// The pace slot spacing: a little shorter than the frame interval, so
+    /// a source that renders at the fps cap (a 60 Hz output under a 60 fps
+    /// level) finds its slot open on arrival. A slot of exactly one frame
+    /// interval drifts against the compositor's clock, and each frame then
+    /// waits for its slot by anything up to a whole interval.
+    fn pace_interval(&self) -> Duration {
+        pace_interval(self.fps_cmd)
     }
 
     /// A frame captured before a resize took effect is stale. The check is
@@ -1094,7 +1117,7 @@ impl Session {
     /// later capture-ring allocation falls back to shared memory.
     fn fall_back_to_cpu(&mut self) -> Result<()> {
         self.video = VideoTier::Cpu;
-        self.encoder_max = stream_limit(gliff_sw::Encoder::MAX_SIZE, &self.caps)?;
+        self.encoder_max = stream_limit(gliff_sw::Encoder::MAX_SIZE, &self.caps, self.max_stream)?;
         self.base_stream =
             EncoderSettings::fit_extent(self.base_stream.0, self.base_stream.1, self.encoder_max);
         let level = self.ladder.level();
@@ -1191,6 +1214,7 @@ impl Session {
             main = encoded.main.len(),
             aux = aux.len(),
             enc_us,
+            held_us = self.held_us,
             inflight_bytes = self.link.inflight_bytes(),
             "queued frame"
         );
@@ -1211,7 +1235,7 @@ impl Session {
         // Pace from the encode start so a slow encode adds no extra wait;
         // after an idle gap or a stall the cadence restarts one interval
         // after this encode, so resuming never sends a burst.
-        let interval = self.frame_interval();
+        let interval = self.pace_interval();
         self.next_send_at = (self.next_send_at + interval).max(t0 + interval);
         self.blocked_noted = false;
         self.frame_id += 1;
@@ -1316,7 +1340,11 @@ impl VideoStart {
         } else {
             ChromaMode::Dual420
         };
-        let encoder_max = stream_limit(video.encoder_max().context("query encoder limits")?, caps)?;
+        let encoder_max = stream_limit(
+            video.encoder_max().context("query encoder limits")?,
+            caps,
+            cfg.max_stream,
+        )?;
         let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
         if stream != (output.width, output.height) {
             tracing::info!(
@@ -1883,6 +1911,28 @@ fn headless_cap(width: u32, height: u32) -> (u32, u32) {
     (w & !1, h & !1)
 }
 
+/// Shrink a private screen that is larger than `--max-stream`, lowering its
+/// scale by the same factor so the desktop keeps its logical size and
+/// renders at the size that is streamed.
+fn fit_max_stream(
+    width: u32,
+    height: u32,
+    scale: f32,
+    max_stream: Option<(u32, u32)>,
+) -> (u32, u32, f32) {
+    let Some((max_w, max_h)) = max_stream else {
+        return (width, height, scale);
+    };
+    let fit = (f64::from(max_w) / f64::from(width))
+        .min(f64::from(max_h) / f64::from(height))
+        .min(1.0);
+    if fit >= 1.0 {
+        return (width, height, scale);
+    }
+    let shrink = |v: u32| ((f64::from(v) * fit) as u32 & !1).max(2);
+    (shrink(width), shrink(height), (scale * fit as f32).max(0.5))
+}
+
 /// The headless mode to ask Hyprland for: the client's window within the
 /// server's cap, rounded so the scale divides it.
 fn headless_target(width: u32, height: u32, scale: f32) -> (u32, u32) {
@@ -1890,10 +1940,24 @@ fn headless_target(width: u32, height: u32, scale: f32) -> (u32, u32) {
     hypr_ipc::clean_mode(width, height, scale)
 }
 
-fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
+/// How much faster than the fps cap the pace timer runs. A source at the
+/// cap never waits for its slot, and a faster one (a 144 Hz mirrored output)
+/// sends at most this much over the cap before latest-wins drops the rest.
+const PACE_HEADROOM: f64 = 1.05;
+
+fn pace_interval(fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / (fps.max(1) as f64 * PACE_HEADROOM))
+}
+
+fn stream_limit(
+    encoder: (u32, u32),
+    caps: &ClientCaps,
+    max_stream: Option<(u32, u32)>,
+) -> Result<(u32, u32)> {
+    let (cap_w, cap_h) = max_stream.unwrap_or((u32::MAX, u32::MAX));
     let limit = (
-        encoder.0.min(caps.max_width),
-        encoder.1.min(caps.max_height),
+        encoder.0.min(caps.max_width).min(cap_w),
+        encoder.1.min(caps.max_height).min(cap_h),
     );
     anyhow::ensure!(
         limit.0 >= 2 && limit.1 >= 2,
@@ -1905,6 +1969,41 @@ fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_stream_shrinks_a_private_screen_and_its_scale_together() {
+        // A 4K window at 1.5x becomes 1440p at 1x: the same 2560x1440 logical desktop.
+        assert_eq!(
+            fit_max_stream(3840, 2160, 1.5, Some((2560, 1440))),
+            (2560, 1440, 1.0)
+        );
+        // A window inside the cap is left alone.
+        assert_eq!(
+            fit_max_stream(1920, 1080, 1.0, Some((2560, 1440))),
+            (1920, 1080, 1.0)
+        );
+        assert_eq!(fit_max_stream(3840, 2160, 1.5, None), (3840, 2160, 1.5));
+        // A tall window is fitted by its height; the sides stay even.
+        let (w, h, s) = fit_max_stream(2160, 3840, 2.0, Some((2560, 1440)));
+        assert!(w % 2 == 0 && h <= 1440 && w <= 2560 && (s - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_source_at_the_fps_cap_finds_its_pace_slot_open() {
+        for (fps, source_hz) in [(60, 60.0), (60, 60.5), (30, 60.0), (15, 60.0), (144, 144.0)] {
+            let pace = pace_interval(fps).as_secs_f64();
+            // The source's next frame, or the frame after it on a lower
+            // level, arrives after the slot opens.
+            let frames_per_slot = (source_hz / fps as f64).round();
+            let arrival = frames_per_slot / source_hz;
+            assert!(
+                pace < arrival,
+                "{fps} fps from {source_hz} Hz: pace {pace} arrival {arrival}"
+            );
+        }
+        // The headroom stays small: the long-run rate stays near the cap.
+        assert!(pace_interval(60).as_secs_f64() > 1.0 / 66.0);
+    }
     #[test]
     fn slow_dpms_ipc_does_not_block_the_streaming_runtime() {
         let (started, ready) = std::sync::mpsc::channel();
@@ -1969,13 +2068,18 @@ mod tests {
             chroma: vec![ChromaMode::Single420],
             features: vec![],
         };
-        let limit = stream_limit((4096, 4096), &caps).unwrap();
+        let limit = stream_limit((4096, 4096), &caps, None).unwrap();
         assert_eq!(EncoderSettings::fit_extent(5120, 1440, limit), (3840, 1080));
+        // The server's --max-stream cap applies on top of the client's.
+        assert_eq!(
+            stream_limit((4096, 4096), &caps, Some((2560, 1440))).unwrap(),
+            (2560, 1440)
+        );
         let bad = ClientCaps {
             max_width: 0,
             ..caps
         };
-        assert!(stream_limit((4096, 4096), &bad).is_err());
+        assert!(stream_limit((4096, 4096), &bad, None).is_err());
     }
 
     #[test]
