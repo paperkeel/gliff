@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container: archlinux:base-devel
     steps:
       - uses: actions/checkout@v7
@@ -25,7 +25,7 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container: archlinux:base-devel
     steps:
       - uses: actions/checkout@v7
@@ -33,7 +33,7 @@ jobs:
       - run: mbx clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container: archlinux:base-devel
     steps:
       - uses: actions/checkout@v7
@@ -43,7 +43,7 @@ jobs:
   release:
     needs: [fmt, clippy, test]
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
     env:
