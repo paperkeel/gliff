@@ -40,6 +40,8 @@ pub struct Config {
     pub bitrate: Option<u32>,
     /// The largest stream to send (`--max-stream`).
     pub max_stream: Option<(u32, u32)>,
+    /// The highest frame rate to stream (`--max-fps`).
+    pub max_fps: u32,
     pub video: VideoMode,
     /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
     pub full_chroma: bool,
@@ -129,7 +131,7 @@ where
         })
         .await?;
     let ladder = Ladder::new(START_LEVEL);
-    let start_fps = ladder.level().fps_cap.min(MAX_FPS);
+    let start_fps = ladder.level().fps_cap.min(DEFAULT_FPS);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
     let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd) {
@@ -242,6 +244,8 @@ where
         client_extent: (caps.max_width, caps.max_height),
         caps,
         max_stream: cfg.max_stream,
+        fps_limit: cfg.max_fps,
+        max_fps: DEFAULT_FPS,
         link: LinkEstimator::new(),
         ctl,
         codec,
@@ -447,6 +451,11 @@ struct Session {
     encoder_max: (u32, u32),
     /// The server's stream cap (`--max-stream`).
     max_stream: Option<(u32, u32)>,
+    /// The server's frame-rate limit (`--max-fps`).
+    fps_limit: u32,
+    /// The session-wide fps ceiling; ladder levels cap below it. It follows
+    /// the refresh rate of the client's monitor within `fps_limit`.
+    max_fps: u32,
     /// A GPU encode has succeeded, so a later failure is not a broken
     /// driver path to fall back from.
     gpu_encoded: bool,
@@ -505,8 +514,9 @@ struct Session {
     cursor_shape_id: u32,
 }
 
-/// The session-wide fps ceiling; ladder levels cap below it.
-const MAX_FPS: u32 = 60;
+/// The fps ceiling and private-screen refresh rate until the client reports
+/// its monitor's refresh rate.
+const DEFAULT_FPS: u32 = 60;
 /// Still-picture refinement: at most this many re-encodes of an unchanged
 /// frame, at least this far apart.
 const MAX_REFINES: u8 = 8;
@@ -556,7 +566,7 @@ impl Session {
                     pixels,
                     dual,
                     can_drop_aux,
-                    MAX_FPS,
+                    self.max_fps,
                 ) {
                     tracing::info!(
                         level,
@@ -611,7 +621,8 @@ impl Session {
                 width,
                 height,
                 scale,
-            } => self.resize(width, height, scale).await?,
+                refresh_mhz,
+            } => self.resize(width, height, scale, refresh_mhz).await?,
             ClientMsg::Ping { t } => self.writer.send(
                 ServerMsg::Pong {
                     t,
@@ -657,7 +668,14 @@ impl Session {
     /// scale, so the remote UI renders at the client's DPI, within the size
     /// it declared in Hello and the server's cap, and restart the encoder
     /// at the new size.
-    async fn resize(&mut self, width: u32, height: u32, scale: f32) -> Result<()> {
+    async fn resize(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f32,
+        refresh_mhz: Option<u32>,
+    ) -> Result<()> {
+        let fps = session_fps(refresh_mhz, self.fps_limit);
         let width = width.min(self.caps.max_width) & !1;
         let height = height.min(self.caps.max_height) & !1;
         let scale = if scale.is_finite() {
@@ -670,19 +688,27 @@ impl Session {
         }
         self.client_extent = (width, height);
         if !self.output.is_headless() {
+            // A mirrored screen renders at its own rate.
+            let own = self
+                .instance
+                .monitors()
+                .ok()
+                .and_then(|m| m.into_iter().find(|m| m.name == self.output.name))
+                .map_or(DEFAULT_FPS, |m| (m.refresh_rate.round() as u32).max(1));
+            self.set_max_fps(fps.min(own))?;
             return self.fit_mirror(width, height);
         }
         let (width, height, scale) = fit_max_stream(width, height, scale, self.max_stream);
         let (width, height) = headless_target(width, height, scale);
         let same_size = (width, height) == (self.output.width, self.output.height);
         let same_scale = (scale - self.output.scale).abs() < 0.01;
-        if same_size && same_scale {
+        if same_size && same_scale && fps == self.max_fps {
             return Ok(());
         }
-        tracing::info!(width, height, scale, "resizing headless output");
+        tracing::info!(width, height, scale, fps, "resizing headless output");
         if let Err(e) = self
             .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
+            .set_monitor_mode(&self.output.name, width, height, fps, scale)
         {
             tracing::warn!(error = %e, "could not resize the headless output");
             return Ok(());
@@ -690,6 +716,8 @@ impl Session {
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
+        let fps_changed = fps != self.max_fps;
+        self.max_fps = fps;
         if !same_size {
             let base = EncoderSettings::fit_extent(width, height, self.encoder_max);
             if base != (width, height) {
@@ -711,16 +739,32 @@ impl Session {
                 self.output.height = old_h;
                 let s = self.output.scale;
                 self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .set_monitor_mode(&self.output.name, old_w, old_h, self.max_fps, s)
                     .ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
             }
         }
+        if same_size && fps_changed {
+            self.apply_stream_params()?;
+        }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
         self.send_config();
+        Ok(())
+    }
+
+    /// Change the session's fps ceiling, and tell the client when it moved.
+    fn set_max_fps(&mut self, fps: u32) -> Result<()> {
+        if fps == self.max_fps {
+            return Ok(());
+        }
+        tracing::info!(fps, "frame-rate ceiling");
+        self.max_fps = fps;
+        if self.apply_stream_params()? {
+            self.send_config();
+        }
         Ok(())
     }
 
@@ -871,6 +915,13 @@ impl Session {
         if self.link_has_room() && now >= self.next_send_at {
             if let Some(frame) = self.pending.take() {
                 self.held_us = now.duration_since(self.pending_since).as_micros();
+                // Ask for the next frame before this encode, so the
+                // compositor renders and copies it while the encoder works.
+                // The ring holds this frame, the last one and the next.
+                if !self.capture_asked {
+                    self.capturer().request_frame().ok();
+                    self.capture_asked = true;
+                }
                 // A frame captured before a resize took effect is stale.
                 if self.matches_output(&frame) {
                     if self.encode_and_send(&frame, false)?.is_none() {
@@ -918,13 +969,21 @@ impl Session {
     /// Room on the link: no frame in the writer queue and the bytes in
     /// flight stay under the cap. The pace timer is checked separately.
     fn link_has_room(&self) -> bool {
-        self.writer.video_ready() && self.byte_cap_has_room(Instant::now())
+        let now = Instant::now();
+        self.writer.video_ready() && self.byte_cap_has_room(now) && self.frame_cap_has_room(now)
     }
 
     fn byte_cap_has_room(&self, now: Instant) -> bool {
         self.link.inflight_bytes() == 0
             || self.link.inflight_bytes() + self.link.est_frame_bytes()
                 <= self.link.cap_bytes(now, self.ctl.is_slow_start())
+    }
+
+    /// Room under the frame cap. A wait here means the client decodes
+    /// slower than frames arrive, which is not link congestion, so it does
+    /// not feed the rate controller.
+    fn frame_cap_has_room(&self, now: Instant) -> bool {
+        self.link.inflight_frames() < self.link.cap_frames(now, self.frame_interval())
     }
 
     fn frame_interval(&self) -> Duration {
@@ -973,7 +1032,7 @@ impl Session {
 
     /// The ladder level's frame-rate ceiling, bounded by the session's.
     fn fps_cap(&self) -> u32 {
-        self.ladder.level().fps_cap.min(MAX_FPS)
+        self.ladder.level().fps_cap.min(self.max_fps)
     }
 
     /// A rung may only drop the auxiliary stream when the client can
@@ -997,9 +1056,9 @@ impl Session {
     /// can sustain.
     fn update_fps_cmd(&mut self) {
         let sustainable = if self.encode_us > 0.0 {
-            (1e6 / (self.encode_us * 1.1)).clamp(5.0, MAX_FPS as f64) as u32
+            (1e6 / (self.encode_us * 1.1)).clamp(5.0, self.max_fps as f64) as u32
         } else {
-            MAX_FPS
+            self.max_fps
         };
         self.fps_cmd = self.fps_cap().min(sustainable).max(1);
     }
@@ -1041,7 +1100,7 @@ impl Session {
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         self.ctl
-            .reconfigure(want.0 as u64 * want.1 as u64, streams, MAX_FPS);
+            .reconfigure(want.0 as u64 * want.1 as u64, streams, self.max_fps);
         let settings = encoder_settings(
             want.0,
             want.1,
@@ -1134,7 +1193,7 @@ impl Session {
         self.ctl.reconfigure(
             self.stream.0 as u64 * self.stream.1 as u64,
             streams,
-            MAX_FPS,
+            self.max_fps,
         );
         self.settings = encoder_settings(
             self.stream.0,
@@ -1357,7 +1416,7 @@ impl VideoStart {
         let ctl = RateController::new(
             stream.0 as u64 * stream.1 as u64,
             streams,
-            MAX_FPS,
+            DEFAULT_FPS,
             cfg.bitrate,
         );
         let settings = encoder_settings(
@@ -1943,6 +2002,17 @@ fn headless_target(width: u32, height: u32, scale: f32) -> (u32, u32) {
     hypr_ipc::clean_mode(width, height, scale)
 }
 
+/// The session's fps ceiling for a client monitor refresh rate: the refresh
+/// rounded to whole Hz, within the server's limit. Without a report the
+/// session runs at 60 Hz.
+fn session_fps(refresh_mhz: Option<u32>, limit: u32) -> u32 {
+    refresh_mhz
+        .filter(|&mhz| mhz >= 10_000)
+        .map_or(DEFAULT_FPS, |mhz| (mhz + 500) / 1000)
+        .min(limit)
+        .max(10)
+}
+
 /// How much faster than the fps cap the pace timer runs. A source at the
 /// cap never waits for its slot, and a faster one (a 144 Hz mirrored output)
 /// sends at most this much over the cap before latest-wins drops the rest.
@@ -2004,6 +2074,16 @@ mod tests {
         // A tall window is fitted by its height; the sides stay even.
         let (w, h, s) = fit_max_stream(2160, 3840, 2.0, Some((2560, 1440)));
         assert!(w % 2 == 0 && h <= 1440 && w <= 2560 && (s - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_session_follows_the_client_refresh_within_the_limit() {
+        assert_eq!(session_fps(Some(150_000), 240), 150);
+        assert_eq!(session_fps(Some(59_940), 240), 60);
+        assert_eq!(session_fps(Some(143_998), 240), 144);
+        assert_eq!(session_fps(Some(240_000), 120), 120);
+        assert_eq!(session_fps(None, 240), 60);
+        assert_eq!(session_fps(Some(0), 240), 60);
     }
 
     #[test]

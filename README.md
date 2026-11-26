@@ -138,6 +138,12 @@ On an RX 7800 XT, a 4K stream encodes in 6.3 ms, and a Ryzen 5 7640U
 decodes it in 8.3 ms. At 2560x1440, the times are 3.2 ms and 4.6 ms. Text is
 less sharp. A mirrored screen is scaled down to the limit.
 
+**High refresh rates.** The client reports the refresh rate of the monitor
+that shows the window. A private screen runs at that rate, up to the
+server's `--max-fps` (240 by default). A mirrored screen also stays within
+its own rate. On the hardware above, a 150 Hz client gets about 105 fps at
+4K, where encode and decode set the limit, and about 130 fps at 2560x1440.
+
 ## If something does not work
 
 - Run `gliff-probe all` on each machine. It checks the compositor, the GPU

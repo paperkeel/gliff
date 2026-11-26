@@ -275,6 +275,24 @@ impl LinkEstimator {
         self.inflight_bytes
     }
 
+    /// Frames sent and not yet acked. Clients ack after decoding, so this
+    /// counts the frames queued in the link and in the client's decoder.
+    pub fn inflight_frames(&self) -> usize {
+        self.sent.len()
+    }
+
+    /// Frames allowed in flight at this frame interval: what one base round
+    /// trip holds, plus one. On a LAN that is two frames (one decoding, one
+    /// arriving), so a client that decodes slower than the server sends
+    /// cannot build a queue; a long round trip still keeps its frame rate.
+    pub fn cap_frames(&self, now: Instant, interval: Duration) -> usize {
+        let Some(base) = self.base_rtt_ms(now) else {
+            return 4;
+        };
+        let per_trip = base / (interval.as_secs_f64() * 1000.0).max(0.1);
+        per_trip.ceil() as usize + 1
+    }
+
     /// The next frame's likely size, for the room check.
     pub fn est_frame_bytes(&self) -> u64 {
         self.avg_frame_bytes.max(1.0) as u64
@@ -573,8 +591,10 @@ impl RateController {
     fn set_bounds(&mut self, pixels: u64, streams: u32, max_fps: u32) {
         self.pixels = pixels;
         self.streams = streams.max(1);
+        // 80 Mbit/s at 60 fps; a faster session keeps the same bits per frame.
+        let ceiling = 80_000_000 * u64::from(max_fps.max(60)) / 60;
         self.max = ((pixels as f64 * streams.max(1) as f64 * max_fps as f64 * MAX_BPP) as u64)
-            .min(80_000_000) as u32;
+            .min(ceiling) as u32;
         // The floor must never exceed the ceiling (a tiny stream, or a
         // `--bitrate` cap below the floor), or the clamps panic.
         self.min = (((pixels as f64 * MIN_BPP * 5.0) as u64).max(100_000) as u32)
@@ -807,6 +827,19 @@ pub fn cpu_rebuild_due(current: (u32, u32), wanted: (u32, u32), since_rebuild: D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_cap_holds_one_round_trip_plus_one() {
+        let mut link = LinkEstimator::new();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs_f64(1.0 / 150.0);
+        assert_eq!(link.cap_frames(t0, interval), 4);
+        link.seed_rtt(t0, 0.3);
+        assert_eq!(link.cap_frames(t0, interval), 2);
+        let mut far = LinkEstimator::new();
+        far.seed_rtt(t0, 50.0);
+        assert_eq!(far.cap_frames(t0, Duration::from_secs_f64(1.0 / 60.0)), 4);
+    }
 
     #[test]
     fn cpu_rebuilds_are_paced_except_for_congestion() {

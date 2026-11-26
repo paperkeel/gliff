@@ -62,6 +62,12 @@ struct Cli {
     /// down. Fewer pixels encode, travel and decode faster.
     #[arg(long, value_parser = parse_size)]
     max_stream: Option<(u32, u32)>,
+    /// Highest frame rate to stream. A private screen runs at the refresh
+    /// rate of the client's monitor up to this limit (60 Hz for a client
+    /// that does not report one); a mirrored screen also stays within its
+    /// own refresh rate.
+    #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(10..=500))]
+    max_fps: u32,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
     /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
     /// the GLIFF_VIDEO environment variable.
@@ -121,6 +127,7 @@ fn main() -> Result<()> {
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
         max_stream: cli.max_stream,
+        max_fps: cli.max_fps,
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
