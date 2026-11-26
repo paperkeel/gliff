@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ash::vk;
 
-use crate::compute::{Recombine, Split};
+use crate::compute::{Recombine, Split, Yuv444ToBgra};
 use crate::device::{Commands, Gpu, Timeline};
 use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
 use crate::vkenc::{self, VkH264Encoder};
@@ -162,13 +162,32 @@ pub struct Encoder {
     gpu: Arc<Gpu>,
     timeline: Timeline,
     compute: Commands,
-    split: Split,
-    main: Stream,
-    aux: Option<Stream>,
+    stage: EncodeStage,
     /// Imported capture buffers, keyed by the caller's buffer id.
     imports: HashMap<u64, Image>,
     settings: EncoderSettings,
 }
+
+/// What turns a captured image into bytes.
+// One per session and never moved after creation: the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum EncodeStage {
+    /// The AVC444 split and one or two H.264 encoders.
+    H264 {
+        split: Split,
+        main: Stream,
+        aux: Option<Stream>,
+    },
+    /// PyroWave on the shared device: one intra-only 4:4:4 picture per frame.
+    Pyro {
+        device: Arc<gliff_pyrowave::Device>,
+        enc: gliff_pyrowave::Encoder,
+    },
+}
+
+/// The packet boundary for PyroWave frames. The transport is ordered and
+/// reliable, so packets only bound the work per packet, not loss.
+const PYRO_PACKET: usize = 1 << 20;
 
 impl Encoder {
     /// The largest size the device encodes, as (width, height).
@@ -192,12 +211,38 @@ impl Encoder {
             gpu: gpu.clone(),
             timeline: Timeline::new(gpu)?,
             compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
-            split: Split::new(gpu)?,
-            main,
-            aux,
+            stage: EncodeStage::H264 {
+                split: Split::new(gpu)?,
+                main,
+                aux,
+            },
             imports: HashMap::new(),
             settings,
         })
+    }
+
+    /// A PyroWave encoder: full 4:4:4, each frame within
+    /// `bitrate / framerate` bits. Fails when PyroWave is unavailable.
+    pub fn new_pyrowave(gpu: &Arc<Gpu>, settings: EncoderSettings) -> Result<Self> {
+        let device = gpu.pyrowave().map_err(Error::Unsupported)?;
+        let enc = gliff_pyrowave::Encoder::new(
+            &device,
+            settings.width,
+            settings.height,
+            gliff_pyrowave::Chroma::Yuv444,
+        )?;
+        Ok(Self {
+            gpu: gpu.clone(),
+            timeline: Timeline::new(gpu)?,
+            compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
+            stage: EncodeStage::Pyro { device, enc },
+            imports: HashMap::new(),
+            settings,
+        })
+    }
+
+    pub fn is_pyrowave(&self) -> bool {
+        matches!(self.stage, EncodeStage::Pyro { .. })
     }
 
     pub fn settings(&self) -> &EncoderSettings {
@@ -216,9 +261,11 @@ impl Encoder {
         self.settings.bitrate = bitrate;
         self.settings.framerate = framerate;
         self.settings.vbv_ms = vbv_ms;
-        self.main.set_rate(bitrate, framerate, vbv_ms);
-        if let Some(a) = &mut self.aux {
-            a.set_rate(bitrate, framerate, vbv_ms);
+        if let EncodeStage::H264 { main, aux, .. } = &mut self.stage {
+            main.set_rate(bitrate, framerate, vbv_ms);
+            if let Some(a) = aux {
+                a.set_rate(bitrate, framerate, vbv_ms);
+            }
         }
     }
 
@@ -279,7 +326,54 @@ impl Encoder {
     ) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
         let t0 = std::time::Instant::now();
-        let (split, main, aux) = (&self.split, &self.main, self.aux.as_ref());
+        let (split, main_stream, aux_stream) = match &mut self.stage {
+            EncodeStage::H264 { split, main, aux } => (split, main, aux),
+            EncodeStage::Pyro { device, enc } => {
+                if transform != 0 {
+                    return Err(Error::Unsupported(
+                        "PyroWave cannot undo an output transform".into(),
+                    ));
+                }
+                // The exact per-frame budget: the bitrate spread over the
+                // frame rate.
+                let budget = (u64::from(self.settings.bitrate)
+                    / u64::from(self.settings.framerate.max(1))
+                    / 8)
+                .max(4096) as usize;
+                let view = gliff_pyrowave::ImageView {
+                    image: vk::Handle::as_raw(src.image),
+                    width: src.width,
+                    height: src.height,
+                    image_format: src.format.as_raw(),
+                    view_format: src.format.as_raw(),
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw(),
+                };
+                let mut encoded = Ok(());
+                self.compute
+                    .run(self.timeline.semaphore, None, None, true, |cmd| {
+                        src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        let raw = vk::Handle::as_raw(cmd) as usize as *mut std::ffi::c_void;
+                        encoded = device.record(raw, || enc.encode_gpu(&view, budget));
+                        Ok(())
+                    })?;
+                encoded?;
+                let t_gpu = t0.elapsed();
+                let frame = enc.packetize(PYRO_PACKET)?;
+                tracing::debug!(
+                    gpu_us = t_gpu.as_micros(),
+                    packetize_us = (t0.elapsed() - t_gpu).as_micros(),
+                    bytes = frame.data.len(),
+                    budget,
+                    "pyrowave encode"
+                );
+                return Ok(EncodedFrame {
+                    keyframe: true,
+                    main: frame.data,
+                    aux: None,
+                });
+            }
+        };
+        let (split, main, aux) = (&*split, &*main_stream, aux_stream.as_ref());
         // The split blocks until it is done: the encoder reads the surfaces
         // through VA-API, which knows nothing of Vulkan's fences, or on the
         // Vulkan encode queue, which then needs no semaphore.
@@ -303,15 +397,15 @@ impl Encoder {
         // Submit both encodes, then wait: the main stream's readback overlaps
         // the aux encode on the GPU.
         let t_split = t0.elapsed();
-        let main_pending = self.main.submit(force_keyframe)?;
-        let aux_pending = match &mut self.aux {
+        let main_pending = main_stream.submit(force_keyframe)?;
+        let aux_pending = match aux_stream {
             Some(a) => Some(a.submit(force_keyframe)?),
             None => None,
         };
         let t_submit = t0.elapsed();
-        let main = self.main.finish(main_pending)?;
+        let main = main_stream.finish(main_pending)?;
         let t_main = t0.elapsed();
-        let aux = match (&mut self.aux, aux_pending) {
+        let aux = match (aux_stream, aux_pending) {
             (Some(a), Some(pending)) => Some(a.finish(pending)?),
             _ => None,
         };
@@ -365,9 +459,7 @@ pub struct Decoder {
     gpu: Arc<Gpu>,
     timeline: Timeline,
     compute: Commands,
-    recombine: Recombine,
-    main: DecodeStream,
-    aux: Option<DecodeStream>,
+    stage: DecodeStage,
     outputs: Vec<(Image, ExportedDmabuf)>,
     /// Counts output rings; a release from an older ring is ignored.
     ring: u64,
@@ -387,14 +479,28 @@ pub struct Decoder {
     last_complete: bool,
 }
 
+/// What turns received bytes into planes the display shader reads.
+// One per session and never moved after creation: the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum DecodeStage {
+    /// One or two H.264 decoders and the AVC444 recombine.
+    H264 {
+        recombine: Recombine,
+        main: DecodeStream,
+        aux: Option<DecodeStream>,
+    },
+    /// PyroWave on the shared device, decoding into three planes.
+    Pyro {
+        device: Arc<gliff_pyrowave::Device>,
+        dec: gliff_pyrowave::Decoder,
+        planes: [Image; 3],
+        convert: Yuv444ToBgra,
+    },
+}
+
 impl Decoder {
     pub fn new(gpu: &Arc<Gpu>, dual: bool, width: u32, height: u32) -> Result<Self> {
-        let (release_tx, release_rx) = channel();
-        let outputs = Self::output_ring(gpu, width, height)?;
-        Ok(Self {
-            gpu: gpu.clone(),
-            timeline: Timeline::new(gpu)?,
-            compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
+        let stage = DecodeStage::H264 {
             recombine: Recombine::new(gpu)?,
             main: DecodeStream::new(gpu, width, height)?,
             aux: if dual {
@@ -402,6 +508,48 @@ impl Decoder {
             } else {
                 None
             },
+        };
+        Self::with_stage(gpu, stage, width, height)
+    }
+
+    /// A PyroWave decoder for a 4:4:4 stream of `width` x `height`. Fails
+    /// when PyroWave is unavailable.
+    pub fn new_pyrowave(gpu: &Arc<Gpu>, width: u32, height: u32) -> Result<Self> {
+        let device = gpu.pyrowave().map_err(Error::Unsupported)?;
+        let dec =
+            gliff_pyrowave::Decoder::new(&device, width, height, gliff_pyrowave::Chroma::Yuv444)?;
+        let plane = || {
+            Image::plain(
+                gpu,
+                vk::Format::R8_UNORM,
+                width,
+                height,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            )
+        };
+        let stage = DecodeStage::Pyro {
+            device,
+            dec,
+            planes: [plane()?, plane()?, plane()?],
+            convert: Yuv444ToBgra::new(gpu)?,
+        };
+        Self::with_stage(gpu, stage, width, height)
+    }
+
+    /// Whether PyroWave can decode on this GPU (the library loads and the
+    /// device has the features).
+    pub fn pyrowave_available(gpu: &Gpu) -> bool {
+        gpu.pyrowave().is_ok()
+    }
+
+    fn with_stage(gpu: &Arc<Gpu>, stage: DecodeStage, width: u32, height: u32) -> Result<Self> {
+        let (release_tx, release_rx) = channel();
+        let outputs = Self::output_ring(gpu, width, height)?;
+        Ok(Self {
+            gpu: gpu.clone(),
+            timeline: Timeline::new(gpu)?,
+            compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
+            stage,
             outputs,
             ring: 0,
             busy: vec![false; DISPLAY_RING],
@@ -473,11 +621,31 @@ impl Decoder {
         }
         let idx = self.free_output();
         let (dst, _) = &self.outputs[idx];
-        let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
-        let Some(main_img) = self.main.last_image() else {
+        let (w, h, zoom) = (self.width, self.height, self.zoom);
+        let (recombine, main, aux) = match &self.stage {
+            DecodeStage::H264 {
+                recombine,
+                main,
+                aux,
+            } => (recombine, main, aux),
+            DecodeStage::Pyro {
+                planes, convert, ..
+            } => {
+                // The planes stay in shader-read layout after a decode.
+                self.compute
+                    .run(self.timeline.semaphore, None, None, true, |cmd| {
+                        dst.transition(cmd, vk::ImageLayout::GENERAL);
+                        convert.record(cmd, planes, dst, (w, h), zoom)?;
+                        dst.memory_barrier(cmd);
+                        Ok(())
+                    })?;
+                return Ok(Some(self.hand_out(idx)?));
+            }
+        };
+        let Some(main_img) = main.last_image() else {
             return Ok(None);
         };
-        let aux_img = match &self.aux {
+        let aux_img = match aux {
             Some(a) => match a.last_image() {
                 Some(img) => Some(img),
                 None => return Ok(None),
@@ -591,12 +759,23 @@ impl Decoder {
     fn decode_to_output(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<usize>> {
         let t0 = std::time::Instant::now();
         self.last_complete = false;
+        if matches!(self.stage, DecodeStage::Pyro { .. }) {
+            return self.decode_pyrowave(main);
+        }
         let idx = self.free_output();
-        let Some(main_idx) = self.main.decode(main)? else {
+        let DecodeStage::H264 {
+            recombine,
+            main: main_stream,
+            aux: aux_stream,
+        } = &mut self.stage
+        else {
+            unreachable!("handled above");
+        };
+        let Some(main_idx) = main_stream.decode(main)? else {
             return Ok(None);
         };
         let t_main = t0.elapsed();
-        let aux_idx = match &mut self.aux {
+        let aux_idx = match aux_stream {
             Some(dec) => match dec.decode(aux)? {
                 Some(i) => Some(i),
                 None => return Ok(None),
@@ -606,15 +785,15 @@ impl Decoder {
         let t_aux = t0.elapsed() - t_main;
         // The decoders run through VA-API, which knows nothing of Vulkan's
         // semaphores: wait for their surfaces before the recombine reads them.
-        self.main.wait(main_idx)?;
-        if let (Some(dec), Some(i)) = (&self.aux, aux_idx) {
+        main_stream.wait(main_idx)?;
+        if let (Some(dec), Some(i)) = (&*aux_stream, aux_idx) {
             dec.wait(i)?;
         }
         let t_wait = t0.elapsed() - t_main - t_aux;
-        let main_img = &self.main.images[main_idx];
-        let aux_img = self.aux.as_ref().zip(aux_idx).map(|(d, i)| &d.images[i]);
+        let main_img = &main_stream.images[main_idx];
+        let aux_img = aux_stream.as_ref().zip(aux_idx).map(|(d, i)| &d.images[i]);
         let (dst, _) = &self.outputs[idx];
-        let (recombine, w, h, zoom) = (&self.recombine, self.width, self.height, self.zoom);
+        let (recombine, w, h, zoom) = (&*recombine, self.width, self.height, self.zoom);
         // The shader fetches the whole stream size from both pictures, aux
         // rows included, so neither may be smaller than it.
         for img in std::iter::once(main_img).chain(aux_img) {
@@ -642,6 +821,67 @@ impl Decoder {
             wait_us = t_wait.as_micros(),
             total_us = t0.elapsed().as_micros(),
             "decode + recombine"
+        );
+        Ok(Some(idx))
+    }
+}
+
+impl Decoder {
+    /// Decode one PyroWave frame into the planes and convert it to a free
+    /// display image, in one submission. `None` when the frame is not
+    /// complete.
+    fn decode_pyrowave(&mut self, frame: &[u8]) -> Result<Option<usize>> {
+        let t0 = std::time::Instant::now();
+        let DecodeStage::Pyro { dec, .. } = &mut self.stage else {
+            unreachable!("only called for a PyroWave stage");
+        };
+        if !dec.push_frame(frame)? {
+            return Ok(None);
+        }
+        let idx = self.free_output();
+        let DecodeStage::Pyro {
+            device,
+            dec,
+            planes,
+            convert,
+        } = &mut self.stage
+        else {
+            unreachable!("checked above");
+        };
+        let views = planes.each_ref().map(|p| gliff_pyrowave::ImageView {
+            image: vk::Handle::as_raw(p.image),
+            width: p.width,
+            height: p.height,
+            image_format: p.format.as_raw(),
+            view_format: p.format.as_raw(),
+            layout: vk::ImageLayout::GENERAL.as_raw(),
+        });
+        let (dst, _) = &self.outputs[idx];
+        let (w, h, zoom) = (self.width, self.height, self.zoom);
+        let mut decoded = Ok(());
+        self.compute
+            .run(self.timeline.semaphore, None, None, true, |cmd| {
+                for p in planes.iter() {
+                    // The old contents are not needed.
+                    p.layout.set(vk::ImageLayout::UNDEFINED);
+                    p.transition(cmd, vk::ImageLayout::GENERAL);
+                }
+                let raw = vk::Handle::as_raw(cmd) as usize as *mut std::ffi::c_void;
+                decoded = device.record(raw, || dec.decode_gpu(&views));
+                for p in planes.iter() {
+                    p.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
+                dst.transition(cmd, vk::ImageLayout::GENERAL);
+                convert.record(cmd, planes, dst, (w, h), zoom)?;
+                dst.memory_barrier(cmd);
+                Ok(())
+            })?;
+        decoded?;
+        self.last_complete = true;
+        tracing::debug!(
+            total_us = t0.elapsed().as_micros(),
+            bytes = frame.len(),
+            "pyrowave decode"
         );
         Ok(Some(idx))
     }

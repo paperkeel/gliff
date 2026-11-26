@@ -23,6 +23,10 @@ use bindings as pw;
 /// The library file name, by its ABI major version.
 pub const LIBRARY_NAME: &str = "libpyrowave-shared.so.1";
 
+/// The chroma value of grey, as a fraction of full scale, used by both ends
+/// of the GPU path (8-bit BT convention: 128/255).
+pub const CHROMA_MIDPOINT: f32 = 128.0 / 255.0;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("PyroWave is not installed: {0}")]
@@ -135,7 +139,102 @@ unsafe impl Send for Device {}
 // SAFETY: as above; shared references only read the handle.
 unsafe impl Sync for Device {}
 
+/// The Vulkan objects of a device that PyroWave shares instead of creating
+/// its own: it then records into the caller's command buffers and reads and
+/// writes the caller's images directly. Handles are raw (dispatchable ones
+/// as pointers, the rest as their 64-bit values) so this crate stays
+/// independent of any Vulkan binding.
+pub struct SharedVulkan {
+    /// `vkGetInstanceProcAddr` of the loader that created the instance.
+    pub get_instance_proc_addr: *const c_void,
+    pub instance: *mut c_void,
+    pub physical_device: *mut c_void,
+    pub device: *mut c_void,
+    /// The create infos the instance and device were made with. They must
+    /// stay valid, with everything they point to, as long as the device.
+    /// The device's pNext chain must hold a VkPhysicalDeviceFeatures2, and
+    /// its queues must include a graphics-capable one.
+    pub instance_create_info: *const c_void,
+    pub device_create_info: *const c_void,
+    /// Queues PyroWave may use for its own uploads: (VkQueue, family, index).
+    pub queues: Vec<(*mut c_void, u32, u32)>,
+}
+
 impl Device {
+    /// Share an existing Vulkan device. Work is then recorded into command
+    /// buffers that [`Device::record`] names.
+    ///
+    /// # Safety
+    /// Every handle and create info in `shared` must be valid and outlive
+    /// the returned device; the device must enable what PyroWave needs
+    /// (8-bit storage, shaderInt16, subgroup size control).
+    pub unsafe fn from_vulkan(lib: &Arc<Library>, shared: &SharedVulkan) -> Result<Arc<Self>> {
+        let mut queues: Vec<pw::pyrowave_device_create_queue_info> = shared
+            .queues
+            .iter()
+            .map(
+                |&(queue, family, index)| pw::pyrowave_device_create_queue_info {
+                    queue: queue as pw::VkQueue,
+                    familyIndex: family,
+                    index,
+                },
+            )
+            .collect();
+        let info = pw::pyrowave_device_create_info {
+            // SAFETY: the caller passes vkGetInstanceProcAddr, whose
+            // signature this is.
+            GetInstanceProcAddr: unsafe {
+                std::mem::transmute::<*const c_void, pw::PFN_vkGetInstanceProcAddr>(
+                    shared.get_instance_proc_addr,
+                )
+            },
+            instance: shared.instance as pw::VkInstance,
+            physical_device: shared.physical_device as pw::VkPhysicalDevice,
+            device: shared.device as pw::VkDevice,
+            instance_create_info: shared.instance_create_info as *const pw::VkInstanceCreateInfo,
+            device_create_info: shared.device_create_info as *const pw::VkDeviceCreateInfo,
+            queue_info: queues.as_mut_ptr(),
+            queue_info_count: queues.len() as u32,
+            queue_lock_callback: None,
+            queue_unlock_callback: None,
+            userdata: std::ptr::null_mut(),
+        };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the caller vouches for the handles; info and raw are valid.
+        check("pyrowave_create_device", unsafe {
+            lib.api.pyrowave_create_device(&info, &mut raw)
+        })?;
+        let device = Arc::new(Self {
+            lib: lib.clone(),
+            raw,
+        });
+        // SAFETY: raw is a live device.
+        check("pyrowave_device_set_queue_type", unsafe {
+            lib.api
+                .pyrowave_device_set_queue_type(raw, pw::VK_QUEUE_COMPUTE_BIT)
+        })?;
+        Ok(device)
+    }
+
+    /// Record PyroWave's commands into `cmd` (a raw VkCommandBuffer of a
+    /// compute queue) while `f` runs, instead of submitting them itself.
+    /// The caller submits `cmd` and waits for it before packetizing an
+    /// encode or using a decode.
+    pub fn record<T>(&self, cmd: *mut c_void, f: impl FnOnce() -> T) -> T {
+        // SAFETY: cmd is in the recording state for the duration of f.
+        unsafe {
+            self.api()
+                .pyrowave_device_set_command_buffer(self.raw, cmd as pw::VkCommandBuffer)
+        };
+        let out = f();
+        // SAFETY: as above; a null handle ends the borrowing.
+        unsafe {
+            self.api()
+                .pyrowave_device_set_command_buffer(self.raw, std::ptr::null_mut())
+        };
+        out
+    }
+
     pub fn new(lib: &Arc<Library>) -> Result<Arc<Self>> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: raw is a valid out pointer.
@@ -256,6 +355,38 @@ fn cpu_buffer(
     })
 }
 
+/// A view of a caller-owned image for the GPU paths (shared device only).
+#[derive(Debug, Clone, Copy)]
+pub struct ImageView {
+    /// The raw VkImage handle.
+    pub image: u64,
+    pub width: u32,
+    pub height: u32,
+    /// VkFormat of the image, and of the view PyroWave reads or writes.
+    pub image_format: i32,
+    pub view_format: i32,
+    /// VkImageLayout the image is in: SHADER_READ_ONLY_OPTIMAL or GENERAL
+    /// for an encode input, GENERAL for a decode output.
+    pub layout: i32,
+}
+
+impl ImageView {
+    fn raw(&self) -> pw::pyrowave_image_view {
+        pw::pyrowave_image_view {
+            image: self.image as usize as pw::VkImage,
+            width: self.width,
+            height: self.height,
+            image_format: self.image_format as pw::VkFormat,
+            view_format: self.view_format as pw::VkFormat,
+            mip_level: 0,
+            layer: 0,
+            aspect: pw::VK_IMAGE_ASPECT_COLOR_BIT,
+            swizzle: pw::VK_COMPONENT_SWIZZLE_IDENTITY,
+            layout: self.layout as pw::VkImageLayout,
+        }
+    }
+}
+
 /// One encoded picture: length-prefixed packets.
 #[derive(Debug, Default, Clone)]
 pub struct Frame {
@@ -356,6 +487,41 @@ impl Encoder {
         })
     }
 
+    /// Record an encode of an RGB(A) UNORM image, scaled to the encoder's
+    /// size and converted to full-range BT.709 YCbCr, into the command
+    /// buffer set with [`Device::record`]. Submit and wait for it before
+    /// [`Encoder::packetize`].
+    pub fn encode_gpu(&mut self, input: &ImageView, max_bytes: usize) -> Result<()> {
+        let info = pw::pyrowave_scaled_encode_info {
+            view: input.raw(),
+            input_color_space: pw::VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            output_color_space: pw::VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            // 16-bit planes: no dither noise on text.
+            intermediate_plane_format: pw::VK_FORMAT_R16_UNORM,
+            ycbcr_chroma_midpoint: CHROMA_MIDPOINT,
+            force_linear_filtering: false,
+            skip_dither: true,
+            crop_rect: std::ptr::null(),
+            ycbcr_range: pw::VK_SAMPLER_YCBCR_RANGE_ITU_FULL,
+            ycbcr_range_bit_depth: 0,
+        };
+        let rate = pw::pyrowave_rate_control {
+            maximum_bitstream_size: max_bytes,
+        };
+        self.budget = max_bytes;
+        // SAFETY: the view names a live image in the stated layout; sync is
+        // left to the caller's command buffer (both sync operations null).
+        check("pyrowave_encoder_encode_gpu_scaled", unsafe {
+            self.device.api().pyrowave_encoder_encode_gpu_scaled(
+                self.raw,
+                std::ptr::null(),
+                std::ptr::null(),
+                &info,
+                &rate,
+            )
+        })
+    }
+
     /// The last encode as a [`Frame`] of packets of at most `boundary` bytes.
     pub fn packetize(&mut self, boundary: usize) -> Result<Frame> {
         let api = self.device.api();
@@ -439,8 +605,19 @@ impl Decoder {
     }
 
     /// Queue every packet of `frame`. Returns whether the picture is
-    /// complete.
+    /// complete. A whole frame that the decoder does not take is from a
+    /// restarted encoder (its sequence counter went back), so the decoder
+    /// forgets the old sequence and takes it.
     pub fn push_frame(&mut self, frame: &[u8]) -> Result<bool> {
+        if self.push_packets(frame)? {
+            return Ok(true);
+        }
+        // SAFETY: raw is a live decoder.
+        unsafe { self.device.api().pyrowave_decoder_clear(self.raw) };
+        self.push_packets(frame)
+    }
+
+    fn push_packets(&mut self, frame: &[u8]) -> Result<bool> {
         let api = self.device.api();
         for packet in frame_packets(frame) {
             let packet = packet?;
@@ -455,6 +632,25 @@ impl Decoder {
         }
         // SAFETY: raw is a live decoder.
         Ok(unsafe { api.pyrowave_decoder_decode_is_ready(self.raw, false) })
+    }
+
+    /// Record a decode of the queued picture into three single-channel
+    /// images (Y, Cb, Cr, STORAGE usage, GENERAL layout) into the command
+    /// buffer set with [`Device::record`].
+    pub fn decode_gpu(&mut self, planes: &[ImageView; 3]) -> Result<()> {
+        let buffers = pw::pyrowave_gpu_buffers {
+            planes: [planes[0].raw(), planes[1].raw(), planes[2].raw()],
+        };
+        // SAFETY: the views name live images in GENERAL layout; sync is left
+        // to the caller's command buffer.
+        check("pyrowave_decoder_decode_gpu_buffer", unsafe {
+            self.device.api().pyrowave_decoder_decode_gpu_buffer(
+                self.raw,
+                std::ptr::null(),
+                std::ptr::null(),
+                &buffers,
+            )
+        })
     }
 
     /// Decode the queued picture into memory. Blocks until the GPU is done.

@@ -42,11 +42,81 @@ pub struct Config {
     pub max_stream: Option<(u32, u32)>,
     /// The highest frame rate to stream (`--max-fps`).
     pub max_fps: u32,
+    /// Which codec to use when the client offers a choice (`--codec`).
+    pub codec: CodecChoice,
+    /// PyroWave's bits per pixel per frame at full rate (`--pyrowave-bpp`).
+    pub pyrowave_bpp: f64,
     pub video: VideoMode,
     /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
     pub full_chroma: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecChoice {
+    /// PyroWave on a direct LAN path, H.264 otherwise.
+    Auto,
+    H264,
+    /// PyroWave whenever the client and the GPU support it.
+    PyroWave,
+}
+
+/// The SSH client's address is on a directly attached network: RFC 1918,
+/// link-local or IPv6 unique-local, and not Tailscale's ranges.
+fn ssh_client_on_lan() -> bool {
+    let Some(addr) = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|c| c.split_whitespace().next().map(str::to_owned))
+        .and_then(|a| a.parse::<std::net::IpAddr>().ok())
+    else {
+        return false;
+    };
+    address_is_lan(addr)
+}
+
+fn address_is_lan(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(a) => {
+            let o = a.octets();
+            let tailscale = o[0] == 100 && (64..128).contains(&o[1]);
+            !tailscale && (a.is_private() || a.is_link_local())
+        }
+        std::net::IpAddr::V6(a) => {
+            let s = a.segments();
+            let ula = (s[0] & 0xfe00) == 0xfc00;
+            let link_local = (s[0] & 0xffc0) == 0xfe80;
+            let tailscale = s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0;
+            !tailscale && (ula || link_local)
+        }
+    }
+}
+
+/// The codec for this session: PyroWave when it is allowed, the client
+/// lists it and can take one 4:4:4 stream, and the GPU shares its device
+/// with PyroWave; H.264 otherwise.
+fn choose_codec(choice: CodecChoice, caps: &ClientCaps, video: &VideoTier) -> Codec {
+    let allowed = match choice {
+        CodecChoice::H264 => false,
+        CodecChoice::PyroWave => true,
+        CodecChoice::Auto => ssh_client_on_lan(),
+    };
+    if !allowed || !caps.codecs.contains(&Codec::PyroWave) {
+        return Codec::H264;
+    }
+    if !caps.chroma.contains(&ChromaMode::Single420) {
+        return Codec::H264;
+    }
+    match video {
+        VideoTier::Gpu(gpu) => match gpu.pyrowave() {
+            Ok(_) => Codec::PyroWave,
+            Err(e) => {
+                tracing::info!(error = %e, "PyroWave unavailable; using H.264");
+                Codec::H264
+            }
+        },
+        VideoTier::Cpu => Codec::H264,
+    }
 }
 
 /// Events from the capture thread.
@@ -113,7 +183,8 @@ where
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
     let video = VideoTier::open(cfg.video, cfg.capture, &cfg.render_node);
-    let codec = Codec::H264;
+    let mut codec = choose_codec(cfg.codec, &caps, &video);
+    tracing::info!(?codec, "video codec");
     writer
         .write_msg(&ServerMsg::HelloAck {
             version: PROTOCOL_VERSION,
@@ -130,15 +201,26 @@ where
             features: features(),
         })
         .await?;
-    let ladder = Ladder::new(START_LEVEL);
+    // PyroWave skips the ladder (its thresholds are H.264's) and so starts
+    // at full quality; H.264 climbs from START_LEVEL as the link proves out.
+    let ladder = Ladder::new(if codec == Codec::PyroWave {
+        0
+    } else {
+        START_LEVEL
+    });
     let start_fps = ladder.level().fps_cap.min(DEFAULT_FPS);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
-    let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd) {
+    let started = match VideoStart::open(video.clone(), &cfg, &caps, &output, fps_cmd, codec) {
         Ok(start) => Ok(start),
+        Err(e) if codec == Codec::PyroWave => {
+            tracing::warn!(error = %format!("{e:#}"), "cannot start PyroWave; using H.264");
+            codec = Codec::H264;
+            VideoStart::open(video, &cfg, &caps, &output, fps_cmd, codec)
+        }
         Err(e) if on_gpu => {
             tracing::warn!(error = %format!("{e:#}"), "cannot start the GPU video pipeline; falling back to the CPU pipeline");
-            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd)
+            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd, codec)
         }
         Err(e) => Err(e),
     };
@@ -558,16 +640,23 @@ impl Session {
                 let dual = self.base_chroma == ChromaMode::Dual420;
                 let can_drop_aux = self.can_drop_aux();
                 let pixels = self.base_stream.0 as u64 * self.base_stream.1 as u64;
-                if let Some(level) = self.ladder.consider(
-                    now,
-                    &self.link,
-                    self.ctl.is_slow_start(),
-                    self.ctl.congested_recently(now),
-                    pixels,
-                    dual,
-                    can_drop_aux,
-                    self.max_fps,
-                ) {
+                // PyroWave stays at full quality: it only runs on a LAN,
+                // and the ladder's thresholds are H.264's.
+                let step = if self.codec == Codec::PyroWave {
+                    None
+                } else {
+                    self.ladder.consider(
+                        now,
+                        &self.link,
+                        self.ctl.is_slow_start(),
+                        self.ctl.congested_recently(now),
+                        pixels,
+                        dual,
+                        can_drop_aux,
+                        self.max_fps,
+                    )
+                };
+                if let Some(level) = step {
                     tracing::info!(
                         level,
                         fps_cap = self.fps_cap(),
@@ -1108,7 +1197,12 @@ impl Session {
             self.fps_cmd,
             self.ctl.vbv_ms(self.fps_cmd),
         );
-        match VideoEncoder::new(&self.video, &settings, chroma == ChromaMode::Dual420) {
+        match VideoEncoder::new(
+            &self.video,
+            &settings,
+            chroma == ChromaMode::Dual420,
+            self.codec,
+        ) {
             Ok(encoder) => {
                 tracing::info!(
                     width = want.0,
@@ -1176,6 +1270,11 @@ impl Session {
     /// later capture-ring allocation falls back to shared memory.
     fn fall_back_to_cpu(&mut self) -> Result<()> {
         self.video = VideoTier::Cpu;
+        if self.codec == Codec::PyroWave {
+            // PyroWave runs on the GPU only.
+            self.codec = Codec::H264;
+            self.ctl.set_pyrowave(None);
+        }
         self.encoder_max = stream_limit(gliff_sw::Encoder::MAX_SIZE, &self.caps, self.max_stream)?;
         self.base_stream =
             EncoderSettings::fit_extent(self.base_stream.0, self.base_stream.1, self.encoder_max);
@@ -1206,6 +1305,7 @@ impl Session {
             &self.video,
             &self.settings,
             self.chroma == ChromaMode::Dual420,
+            self.codec,
         )?;
         self.encode_us = 0.0;
         self.want_keyframe = true;
@@ -1304,6 +1404,7 @@ impl Session {
 
 /// The selected video pipeline: Vulkan compute and VA-API on the GPU, or
 /// OpenH264 on the CPU for machines without them.
+#[derive(Clone)]
 enum VideoTier {
     Gpu(Arc<Gpu>),
     Cpu,
@@ -1385,6 +1486,7 @@ impl VideoStart {
         caps: &ClientCaps,
         output: &SessionOutput,
         fps: u32,
+        codec: Codec,
     ) -> Result<Self> {
         // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4
         // doubles the encode work, which the CPU pays for where the GPU
@@ -1392,7 +1494,11 @@ impl VideoStart {
         // the mode.
         let prefer_single =
             cfg.low_bandwidth || (matches!(video, VideoTier::Cpu) && !cfg.full_chroma);
-        let chroma = if !caps.chroma.contains(&ChromaMode::Dual420)
+        // PyroWave is always 4:4:4 in one stream; Single420 stands for
+        // "one stream" in the rate control (choose_codec checked the client
+        // takes it).
+        let chroma = if codec == Codec::PyroWave
+            || !caps.chroma.contains(&ChromaMode::Dual420)
             || (prefer_single && caps.chroma.contains(&ChromaMode::Single420))
         {
             ChromaMode::Single420
@@ -1413,12 +1519,15 @@ impl VideoStart {
             );
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
-        let ctl = RateController::new(
+        let mut ctl = RateController::new(
             stream.0 as u64 * stream.1 as u64,
             streams,
             DEFAULT_FPS,
             cfg.bitrate,
         );
+        if codec == Codec::PyroWave {
+            ctl.set_pyrowave(Some(cfg.pyrowave_bpp));
+        }
         let settings = encoder_settings(
             stream.0,
             stream.1,
@@ -1426,7 +1535,7 @@ impl VideoStart {
             fps,
             ctl.vbv_ms(fps),
         );
-        let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
+        let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420, codec)
             .context("create encoder")?;
         Ok(Self {
             video,
@@ -1446,8 +1555,11 @@ enum VideoEncoder {
 }
 
 impl VideoEncoder {
-    fn new(tier: &VideoTier, settings: &EncoderSettings, dual: bool) -> Result<Self> {
+    fn new(tier: &VideoTier, settings: &EncoderSettings, dual: bool, codec: Codec) -> Result<Self> {
         match tier {
+            VideoTier::Gpu(gpu) if codec == Codec::PyroWave => Ok(Self::Gpu(Box::new(
+                Encoder::new_pyrowave(gpu, settings.clone())?,
+            ))),
             VideoTier::Gpu(gpu) => Ok(Self::Gpu(Box::new(Encoder::new(
                 gpu,
                 settings.clone(),
@@ -2074,6 +2186,26 @@ mod tests {
         // A tall window is fitted by its height; the sides stay even.
         let (w, h, s) = fit_max_stream(2160, 3840, 2.0, Some((2560, 1440)));
         assert!(w % 2 == 0 && h <= 1440 && w <= 2560 && (s - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn only_direct_lan_addresses_count_as_lan() {
+        for (addr, lan) in [
+            ("192.168.1.231", true),
+            ("10.0.0.4", true),
+            ("172.20.1.2", true),
+            ("169.254.3.4", true),
+            ("fd12:3456::1", true),
+            ("fe80::1", true),
+            ("100.89.1.24", false),
+            ("100.64.0.1", false),
+            ("fd7a:115c:a1e0::ea35:fa2f", false),
+            ("203.0.113.9", false),
+            ("8.8.8.8", false),
+            ("2001:db8::1", false),
+        ] {
+            assert_eq!(address_is_lan(addr.parse().unwrap()), lan, "{addr}");
+        }
     }
 
     #[test]

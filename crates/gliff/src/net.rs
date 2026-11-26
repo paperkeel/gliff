@@ -183,6 +183,7 @@ async fn read_cursor<R: AsyncRead + Unpin>(
 struct Config {
     stream: (u32, u32),
     chroma: ChromaMode,
+    codec: Codec,
     scale_milli: u32,
     view: (u32, u32),
     fps_cap: u32,
@@ -201,10 +202,15 @@ impl Config {
         Ok(Self {
             stream,
             chroma,
+            codec: Codec::H264,
             scale_milli,
             view,
             fps_cap,
         })
+    }
+
+    fn with_codec(self, codec: Codec) -> Self {
+        Self { codec, ..self }
     }
 
     fn geometry(&self) -> Geometry {
@@ -215,7 +221,8 @@ impl Config {
     /// new decoder. Keep the requested zoom: each frame clamps it against
     /// its actual size, without another UI request or CPU keyframe.
     fn update(&mut self, next: Config, zoom: &mut Zoom) -> bool {
-        let rebuild = (next.stream, next.chroma) != (self.stream, self.chroma);
+        let rebuild =
+            (next.stream, next.chroma, next.codec) != (self.stream, self.chroma, self.codec);
         if rebuild {
             zoom.asked_gpu = 1;
         }
@@ -399,11 +406,22 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
 
 fn new_decoder(
     gpu: &Option<Arc<Gpu>>,
+    codec: Codec,
     chroma: ChromaMode,
     width: u32,
     height: u32,
 ) -> anyhow::Result<VideoDecoder> {
     validate_stream_size(width, height)?;
+    if codec == Codec::PyroWave {
+        // The server sends PyroWave only when the caps listed it, which
+        // needs the GPU.
+        let gpu = gpu
+            .as_ref()
+            .context("a PyroWave stream needs the GPU pipeline")?;
+        return Ok(VideoDecoder::Gpu(Box::new(Decoder::new_pyrowave(
+            gpu, width, height,
+        )?)));
+    }
     let dual = chroma != ChromaMode::Single420;
     if let Some(gpu) = gpu {
         match Decoder::new(gpu, dual, width, height) {
@@ -429,12 +447,17 @@ impl VideoDecoder {
 
 /// The tiers in use, server then client, as the stats line shows them:
 /// "GPU→GPU".
-fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder) -> String {
+fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder, codec: Codec) -> String {
     let server = pipeline.map_or("?", |p| match p {
         VideoPipeline::Gpu => "GPU",
         VideoPipeline::Cpu => "CPU",
     });
-    format!("{server}→{}", decoder.label())
+    let codec = if codec == Codec::PyroWave {
+        " PyroWave"
+    } else {
+        ""
+    };
+    format!("{server}→{}{codec}", decoder.label())
 }
 
 async fn session<R, W>(
@@ -454,8 +477,13 @@ where
     let mut writer = Framed::new(wr);
 
     let gpu = open_gpu(video);
+    let mut codecs = vec![Codec::H264];
+    if gpu.as_deref().is_some_and(Decoder::pyrowave_available) {
+        codecs.push(Codec::PyroWave);
+    }
+    tracing::info!(?codecs, "decoders");
     let caps = ClientCaps {
-        codecs: vec![Codec::H264],
+        codecs,
         max_width: MAX_STREAM.0,
         max_height: MAX_STREAM.1,
         // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
@@ -505,6 +533,7 @@ where
             }
             ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
             ServerMsg::StreamConfig {
+                codec,
                 width,
                 height,
                 chroma,
@@ -521,7 +550,8 @@ where
                     scale_milli,
                     (view_width, view_height),
                     fps_cap,
-                )?;
+                )?
+                .with_codec(codec);
                 break (cfg, pipeline);
             }
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
@@ -533,8 +563,8 @@ where
             other => anyhow::bail!("unexpected message before StreamConfig: {other:?}"),
         }
     };
-    let mut decoder = new_decoder(&gpu, cfg.chroma, cfg.stream.0, cfg.stream.1)?;
-    let mut video_label = tier_label(pipeline, &decoder);
+    let mut decoder = new_decoder(&gpu, cfg.codec, cfg.chroma, cfg.stream.0, cfg.stream.1)?;
+    let mut video_label = tier_label(pipeline, &decoder, cfg.codec);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: cfg.view.0,
@@ -844,6 +874,7 @@ where
                 }
             }
             ServerMsg::StreamConfig {
+                codec,
                 width,
                 height,
                 chroma,
@@ -860,16 +891,17 @@ where
                     scale_milli,
                     (view_width, view_height),
                     fps_cap,
-                )?;
+                )?
+                .with_codec(codec);
                 // A pace-only change (fps cap) must not reset the decoder;
                 // a coded-stream change does, and drops the frame waiting
                 // for the UI with it.
                 if cfg.update(next, &mut zoom) {
-                    decoder = new_decoder(&gpu, chroma, width, height)?;
+                    decoder = new_decoder(&gpu, codec, chroma, width, height)?;
                     undelivered = None;
                     in_decoder.clear();
                 }
-                video_label = tier_label(pipeline, &decoder);
+                video_label = tier_label(pipeline, &decoder, cfg.codec);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,

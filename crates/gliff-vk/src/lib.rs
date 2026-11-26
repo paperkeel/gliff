@@ -21,6 +21,8 @@ pub enum Error {
     StreamSize(String),
     #[error("va-api: {0}")]
     Va(#[from] gliff_va::Error),
+    #[error("pyrowave: {0}")]
+    PyroWave(#[from] gliff_pyrowave::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

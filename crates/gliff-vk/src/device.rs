@@ -3,9 +3,10 @@
 
 use std::ffi::{c_char, CStr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
+use ash::vk::Handle;
 
 use crate::{Error, Result};
 
@@ -75,8 +76,26 @@ pub struct Gpu {
     /// The queue family index that stands for VA-API in ownership
     /// transfers: FOREIGN when the driver has it, else EXTERNAL.
     pub(crate) foreign_family: u32,
+    /// What PyroWave needs to share this device, when it has the features.
+    pyro_share: Option<PyroShare>,
+    /// The shared PyroWave device, made on first use.
+    pyrowave: OnceLock<std::result::Result<Arc<gliff_pyrowave::Device>, String>>,
     _entry: ash::Entry,
 }
+
+/// The create infos the instance and device were made with, and the queues
+/// PyroWave may use. The infos are 'static (allocated once per device and
+/// never freed) because PyroWave reads them for the life of the device.
+struct PyroShare {
+    instance_info: &'static vk::InstanceCreateInfo<'static>,
+    device_info: &'static vk::DeviceCreateInfo<'static>,
+    queues: Vec<(vk::Queue, u32)>,
+}
+
+// SAFETY: the infos are immutable after device creation and only read.
+unsafe impl Send for PyroShare {}
+// SAFETY: as above.
+unsafe impl Sync for PyroShare {}
 
 const REQUIRED_EXTENSIONS: &[&CStr] = &[
     ash::khr::external_memory_fd::NAME,
@@ -103,13 +122,15 @@ impl Gpu {
         // NUL-terminated names; nothing outlives the entry it came from.
         unsafe {
             let entry = ash::Entry::load()?;
-            let app = vk::ApplicationInfo::default()
-                .application_name(c"gliff")
-                .api_version(vk::API_VERSION_1_3);
-            let instance = entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app),
-                None,
-            )?;
+            let app: &'static vk::ApplicationInfo<'static> = Box::leak(Box::new(
+                vk::ApplicationInfo::default()
+                    .application_name(c"gliff")
+                    .api_version(vk::API_VERSION_1_3),
+            ));
+            let instance_info: &'static vk::InstanceCreateInfo<'static> = Box::leak(Box::new(
+                vk::InstanceCreateInfo::default().application_info(app),
+            ));
+            let instance = entry.create_instance(instance_info, None)?;
             let wanted = render_node.and_then(drm_dev_number);
             let mut chosen = None;
             for pd in instance.enumerate_physical_devices()? {
@@ -183,9 +204,24 @@ impl Gpu {
                 .map(|f| queue_count(&instance, physical, f).min(2))
                 .unwrap_or(0);
 
-            let priority = [1.0f32, 1.0];
-            let queue_infos: Vec<vk::DeviceQueueCreateInfo> = families
-                .all()
+            // PyroWave (the LAN codec) shares this device when it has the
+            // features PyroWave needs; it also needs a graphics queue in the
+            // device, though gliff records its work on the compute queue.
+            let pyro = pyro_features(&instance, physical);
+            let graphics_family = if pyro.is_some() {
+                graphics_family(&instance, physical)
+            } else {
+                None
+            };
+            let pyro = pyro.filter(|_| graphics_family.is_some());
+            let priority: &'static [f32; 2] = &[1.0, 1.0];
+            let mut all_families = families.all();
+            if let Some(g) = graphics_family {
+                if !all_families.contains(&g) {
+                    all_families.push(g);
+                }
+            }
+            let queue_infos: Vec<vk::DeviceQueueCreateInfo> = all_families
                 .into_iter()
                 .map(|f| {
                     let n = if Some(f) == families.encode {
@@ -208,16 +244,57 @@ impl Gpu {
                 instance.get_physical_device_features2(physical, &mut features);
                 supported.robust_image_access == vk::TRUE
             };
-            let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
-            let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
-                .synchronization2(true)
-                .robust_image_access(robust_image_access);
-            let create = vk::DeviceCreateInfo::default()
-                .queue_create_infos(&queue_infos)
-                .enabled_extension_names(&names)
-                .push_next(&mut f12)
-                .push_next(&mut f13);
-            let device = instance.create_device(physical, &create, None)?;
+            let pyro_on = pyro.is_some();
+            let f13: &'static mut vk::PhysicalDeviceVulkan13Features<'static> =
+                Box::leak(Box::new(
+                    vk::PhysicalDeviceVulkan13Features::default()
+                        .synchronization2(true)
+                        .robust_image_access(robust_image_access)
+                        .subgroup_size_control(pyro_on)
+                        .compute_full_subgroups(pyro_on),
+                ));
+            let p = pyro.unwrap_or_default();
+            let f12: &'static mut vk::PhysicalDeviceVulkan12Features<'static> =
+                Box::leak(Box::new(
+                    vk::PhysicalDeviceVulkan12Features::default()
+                        .timeline_semaphore(true)
+                        .storage_buffer8_bit_access(pyro_on)
+                        .uniform_and_storage_buffer8_bit_access(p.uniform8)
+                        .shader_int8(p.int8)
+                        .shader_float16(p.float16),
+                ));
+            let f11: &'static mut vk::PhysicalDeviceVulkan11Features<'static> =
+                Box::leak(Box::new(
+                    vk::PhysicalDeviceVulkan11Features::default()
+                        .storage_buffer16_bit_access(p.storage16),
+                ));
+            let f2: &'static mut vk::PhysicalDeviceFeatures2<'static> = Box::leak(Box::new(
+                vk::PhysicalDeviceFeatures2::default()
+                    .features(vk::PhysicalDeviceFeatures::default().shader_int16(pyro_on)),
+            ));
+            f12.p_next = (f13 as *mut vk::PhysicalDeviceVulkan13Features).cast();
+            f11.p_next = (f12 as *mut vk::PhysicalDeviceVulkan12Features).cast();
+            f2.p_next = (f11 as *mut vk::PhysicalDeviceVulkan11Features).cast();
+            let queue_infos: &'static [vk::DeviceQueueCreateInfo<'static>] =
+                Box::leak(queue_infos.into_boxed_slice());
+            let names: &'static [*const c_char] = Box::leak(names.into_boxed_slice());
+            let mut create = vk::DeviceCreateInfo::default()
+                .queue_create_infos(queue_infos)
+                .enabled_extension_names(names);
+            create.p_next = (f2 as *const vk::PhysicalDeviceFeatures2).cast();
+            let device_info: &'static vk::DeviceCreateInfo<'static> = Box::leak(Box::new(create));
+            let device = instance.create_device(physical, device_info, None)?;
+            let pyro_share = pyro_on.then(|| PyroShare {
+                instance_info,
+                device_info,
+                queues: queue_infos
+                    .iter()
+                    .map(|q| {
+                        let family = q.queue_family_index;
+                        (device.get_device_queue(family, 0), family)
+                    })
+                    .collect(),
+            });
             let foreign_family = if has(ash::ext::queue_family_foreign::NAME) {
                 vk::QUEUE_FAMILY_FOREIGN_EXT
             } else {
@@ -271,6 +348,8 @@ impl Gpu {
                 va_caps,
                 video_encode,
                 foreign_family,
+                pyro_share,
+                pyrowave: OnceLock::new(),
                 families,
                 instance,
                 physical,
@@ -279,6 +358,42 @@ impl Gpu {
             };
             Ok(Arc::new(gpu))
         }
+    }
+
+    /// The PyroWave device sharing this one, made on first use. Fails when
+    /// the library is not installed or the GPU lacks the features.
+    pub fn pyrowave(&self) -> std::result::Result<Arc<gliff_pyrowave::Device>, String> {
+        self.pyrowave
+            .get_or_init(|| {
+                let share = self
+                    .pyro_share
+                    .as_ref()
+                    .ok_or("the Vulkan device lacks the features PyroWave needs")?;
+                let lib = gliff_pyrowave::Library::load().map_err(|e| e.to_string())?;
+                let shared = gliff_pyrowave::SharedVulkan {
+                    get_instance_proc_addr: self._entry.static_fn().get_instance_proc_addr
+                        as *const std::ffi::c_void,
+                    instance: self.instance.handle().as_raw() as usize as *mut _,
+                    physical_device: self.physical.as_raw() as usize as *mut _,
+                    device: self.device.handle().as_raw() as usize as *mut _,
+                    instance_create_info: (share.instance_info as *const vk::InstanceCreateInfo)
+                        .cast(),
+                    device_create_info: (share.device_info as *const vk::DeviceCreateInfo).cast(),
+                    queues: share
+                        .queues
+                        .iter()
+                        .map(|&(q, family)| (q.as_raw() as usize as *mut _, family, 0))
+                        .collect(),
+                };
+                // SAFETY: the handles are this device's, and the create infos
+                // are the 'static ones it was made with; the PyroWave device
+                // is dropped with self, before the Vulkan device.
+                let device = unsafe { gliff_pyrowave::Device::from_vulkan(&lib, &shared) }
+                    .map_err(|e| e.to_string())?;
+                tracing::info!(library = %lib.path.display(), "PyroWave shares the Vulkan device");
+                Ok(device)
+            })
+            .clone()
     }
 
     /// Whether the GPU encodes H.264 at all: through VA-API, or through
@@ -412,6 +527,8 @@ impl Drop for Gpu {
         // owner before the Arc<Gpu> count reached zero.
         unsafe {
             let _ = self.device.device_wait_idle();
+            // PyroWave's objects on this device go first.
+            drop(self.pyrowave.take());
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -447,6 +564,51 @@ fn pick_families(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<Fam
         compute: compute as u32,
         encode: encode.map(|e| e as u32),
     })
+}
+
+/// Optional features enabled with PyroWave when the device has them.
+#[derive(Clone, Copy, Default)]
+struct PyroOptional {
+    uniform8: bool,
+    int8: bool,
+    float16: bool,
+    storage16: bool,
+}
+
+/// The features PyroWave needs: 8-bit storage, shaderInt16 and subgroup
+/// size control with full subgroups. `None` when one is missing.
+fn pyro_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<PyroOptional> {
+    let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+    let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut f2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut f11)
+        .push_next(&mut f12)
+        .push_next(&mut f13);
+    // SAFETY: valid physical device; the chain lives on this stack frame.
+    unsafe { instance.get_physical_device_features2(pd, &mut f2) };
+    let required = f2.features.shader_int16 == vk::TRUE
+        && f12.storage_buffer8_bit_access == vk::TRUE
+        && f13.subgroup_size_control == vk::TRUE
+        && f13.compute_full_subgroups == vk::TRUE;
+    required.then_some(PyroOptional {
+        uniform8: f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
+        int8: f12.shader_int8 == vk::TRUE,
+        float16: f12.shader_float16 == vk::TRUE,
+        storage16: f11.storage_buffer16_bit_access == vk::TRUE,
+    })
+}
+
+fn graphics_family(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<u32> {
+    // SAFETY: valid physical device.
+    let props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+    props
+        .iter()
+        .position(|p| {
+            p.queue_flags
+                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+        })
+        .map(|i| i as u32)
 }
 
 fn queue_count(instance: &ash::Instance, pd: vk::PhysicalDevice, family: u32) -> u32 {

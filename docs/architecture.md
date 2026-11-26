@@ -322,6 +322,39 @@ Shaped-link runs (`scripts/bench.sh`, nested Hyprland, 2560x1440 headless,
 | `dsl` (20 Mbit/s, 10 ms one-way) | 50 fps, 15.8 Mbit/s, 0 gaps, no ladder flap |
 | `satellite` (2.5 Mbit/s, 550 ms one-way, 10% random loss BOTH ways) | first frame decoded 4.0 s, settles on the 10 fps single-stream rungs; 60 decoded frames in 19.5 s vs 29.7 s for the pre-adaptation server. TCP loss recovery still stalls the stream (gaps of seconds); that is the head-of-line blocking a UDP media path would remove. |
 
+## PyroWave
+
+PyroWave is the codec for a direct LAN path. gliff loads
+`libpyrowave-shared.so` at run time (`crates/gliff-pyrowave`, committed
+bindgen output), so a machine without it stays on H.264.
+
+- **One Vulkan device.** PyroWave shares the `gliff-vk` device
+  (`pyrowave_create_device`) and records into gliff's command buffers. When
+  the device has 8-bit storage, shaderInt16 and subgroup size control,
+  `Gpu::open` enables them, adds a graphics queue (PyroWave needs one in the
+  device), and keeps the instance and device create infos for the life of
+  the process, because PyroWave reads them.
+- **Server.** The captured dmabuf, imported as before, goes to
+  `pyrowave_encoder_encode_gpu_scaled` as an RGB view. PyroWave converts to
+  full-range BT.709 with 16-bit intermediate planes (no dither) and writes
+  one frame within an exact byte budget: the rate controller's bitrate over
+  the frame rate. Every frame is a keyframe, sent as length-prefixed packets
+  in the main payload.
+- **Client.** The decoder writes three R8 planes, and `yuv444.comp` converts
+  them to the BGRA display image that GTK imports, with the same integer
+  zoom as the recombine.
+- **Selection.** The client lists `Codec::PyroWave` when its GPU shares a
+  device with PyroWave. The server uses it when the client lists it, the
+  `SSH_CONNECTION` address is RFC 1918, link-local or IPv6 ULA (not
+  Tailscale), and its own GPU shares a device; `--codec` overrides this.
+  PyroWave skips the quality ladder and starts at half its ceiling:
+  `--pyrowave-bpp` (1.5) bits per pixel at full rate, within 1.8 Gbit/s.
+- **Measurements** (RX 7800 XT server, Ryzen 5 7640U client, 2.5 GbE, SSH):
+  at 4K and 1.5 bpp, encode 2.1-2.9 ms, transfer 4 ms (1.5 MB), decode and
+  convert 4-5.4 ms on the client. In a nested Hyprland with both ends on
+  the desktop GPU, a 4K 150 Hz stream runs at 148 fps with 4.3 ms from
+  send to decoded.
+
 ## Pending and recommended improvements
 
 Built and validated on AMD and on Intel Panther Lake: capture, input, VA-API

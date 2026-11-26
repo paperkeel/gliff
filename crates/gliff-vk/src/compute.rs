@@ -11,6 +11,7 @@ use crate::Result;
 
 const SPLIT_SPV: &[u8] = include_bytes!("../shaders/split.spv");
 const RECOMBINE_SPV: &[u8] = include_bytes!("../shaders/recombine.spv");
+const YUV444_SPV: &[u8] = include_bytes!("../shaders/yuv444.spv");
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -305,5 +306,35 @@ impl Recombine {
         ];
         self.0
             .dispatch(cmd, &views, width, height, aux.is_some(), zoom.max(1))
+    }
+}
+
+/// PyroWave's decoded planes (Y, Cb, Cr, full-range BT.709) -> BGRA
+/// display image.
+pub(crate) struct Yuv444ToBgra(Pass);
+
+impl Yuv444ToBgra {
+    pub(crate) fn new(gpu: &Arc<Gpu>) -> Result<Self> {
+        Ok(Self(Pass::new(gpu, YUV444_SPV, 3, 1, vk::Filter::NEAREST)?))
+    }
+
+    /// The planes must be in SHADER_READ_ONLY_OPTIMAL and `dst` in GENERAL;
+    /// `dst` is `zoom` times the stream size in each direction.
+    pub(crate) fn record(
+        &self,
+        cmd: vk::CommandBuffer,
+        planes: &[Image; 3],
+        dst: &Image,
+        (width, height): (u32, u32),
+        zoom: u32,
+    ) -> Result<()> {
+        let views = [
+            planes[0].view0(),
+            planes[1].view0(),
+            planes[2].view0(),
+            dst.view0(),
+        ];
+        self.0
+            .dispatch(cmd, &views, width, height, false, zoom.max(1))
     }
 }
