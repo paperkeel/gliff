@@ -122,13 +122,21 @@ tabs also cancels unfinished pastes to the tab you leave.
 
 **Slow links.** gliff measures the link and lowers the frame rate, then the
 colour detail, then the resolution, and raises them again when there is
-room. Two flags change the video, and you pass them to the server through
-`--server-bin`: `--low-bandwidth` sends 4:2:0 colour from the start, and
-`--full-chroma` keeps 4:4:4 on a server that encodes on the CPU.
+room. Three flags change the video, and you pass them to the server through
+`--server-bin`: `--low-bandwidth` sends 4:2:0 colour from the start,
+`--full-chroma` keeps 4:4:4 on a server that encodes on the CPU, and
+`--max-stream WIDTHxHEIGHT` limits the stream size.
 
 ```
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
+
+**Lower latency at a smaller size.** `--max-stream 2560x1440` renders a
+private screen at 2560x1440 and lowers its scale by the same factor, so the
+desktop keeps its layout. The client then scales the picture to the window.
+On an RX 7800 XT, a 4K stream encodes in 6.3 ms, and a Ryzen 5 7640U
+decodes it in 8.3 ms. At 2560x1440, the times are 3.2 ms and 4.6 ms. Text is
+less sharp. A mirrored screen is scaled down to the limit.
 
 ## If something does not work
 
