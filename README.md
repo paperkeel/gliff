@@ -1,6 +1,14 @@
-# gliff
+# gliff (personal fork)
 
-[![CI](https://github.com/omacom/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/omacom/gliff/actions/workflows/ci.yml)
+> **This fork is not for general use.** It is a personal fork of
+> [omacom/gliff](https://github.com/omacom/gliff), tuned for a small set of
+> machines on one home network: lower latency, high refresh rates, and an
+> experimental PyroWave codec for direct LAN sessions. It is not maintained
+> for anyone else. It gets no support, no releases and no stability promise,
+> and it can change or break at any time. To use gliff, install the
+> [upstream project](https://github.com/omacom/gliff).
+
+[![CI](https://github.com/paperkeel/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/paperkeel/gliff/actions/workflows/ci.yml)
 
 gliff is a remote desktop for Hyprland. It shows the Hyprland session of
 another machine in a window on yours, and all it needs between the two is
