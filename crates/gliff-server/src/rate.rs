@@ -552,9 +552,18 @@ pub struct RateController {
     got_ack: bool,
     streams: u32,
     pixels: u64,
+    max_fps: u32,
+    /// PyroWave's bits per pixel per frame at full rate, when the stream
+    /// is PyroWave: an intra-only codec that needs ~1-2.
+    pyrowave: Option<f64>,
 }
 
 pub const MAX_BPP: f64 = 0.1;
+/// PyroWave's lower bound in bits per pixel per frame: still readable text.
+/// The upper bound comes from `set_pyrowave` (`--pyrowave-bpp`).
+const PYRO_MIN_BPP: f64 = 0.3;
+/// The most PyroWave sends, whatever the size and rate: within 2.5 GbE.
+const PYRO_CEILING: u64 = 1_800_000_000;
 pub const MIN_BPP: f64 = 0.005;
 pub const FLOOR_BPP: f64 = 0.03;
 const INITIAL_BPS: u32 = 3_000_000;
@@ -582,15 +591,40 @@ impl RateController {
             got_ack: false,
             streams: streams.max(1),
             pixels,
+            max_fps,
+            pyrowave: None,
         };
         ctl.set_bounds(pixels, streams, max_fps);
         ctl.target = INITIAL_BPS.clamp(ctl.min, ctl.effective_max());
         ctl
     }
 
+    /// Switch to PyroWave's bounds (or back), starting at half the ceiling
+    /// for PyroWave: it only runs on a LAN, and a low start would send
+    /// blurry frames until slow start caught up.
+    pub fn set_pyrowave(&mut self, max_bpp: Option<f64>) {
+        self.pyrowave = max_bpp;
+        self.set_bounds(self.pixels, self.streams, self.max_fps);
+        self.target = if max_bpp.is_some() {
+            (self.effective_max() / 2).max(self.min)
+        } else {
+            self.target.clamp(self.min, self.effective_max())
+        };
+    }
+
     fn set_bounds(&mut self, pixels: u64, streams: u32, max_fps: u32) {
         self.pixels = pixels;
         self.streams = streams.max(1);
+        self.max_fps = max_fps;
+        if let Some(max_bpp) = self.pyrowave {
+            let per_second = pixels as f64 * max_fps.max(1) as f64;
+            self.max = ((per_second * max_bpp) as u64).min(PYRO_CEILING) as u32;
+            self.min = (((per_second * PYRO_MIN_BPP) as u64).min(self.max as u64) as u32)
+                .min(self.effective_max_raw())
+                .max(1);
+            self.floor_bpf = (pixels as f64 * PYRO_MIN_BPP) as u32;
+            return;
+        }
         // 80 Mbit/s at 60 fps; a faster session keeps the same bits per frame.
         let ceiling = 80_000_000 * u64::from(max_fps.max(60)) / 60;
         self.max = ((pixels as f64 * streams.max(1) as f64 * max_fps as f64 * MAX_BPP) as u64)
@@ -827,6 +861,21 @@ pub fn cpu_rebuild_due(current: (u32, u32), wanted: (u32, u32), since_rebuild: D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pyrowave_bounds_follow_its_bits_per_pixel() {
+        let pixels = 3840 * 2160;
+        let mut ctl = RateController::new(pixels, 1, 60, None);
+        ctl.set_pyrowave(Some(1.5));
+        // 1.5 bits per pixel at 60 fps is ~746 Mbit/s; it starts at half.
+        assert_eq!(ctl.effective_max(), (pixels as f64 * 60.0 * 1.5) as u32);
+        assert_eq!(ctl.target(), ctl.effective_max() / 2);
+        // At 150 fps the ceiling keeps it within 2.5 GbE.
+        ctl.reconfigure(pixels, 1, 150);
+        assert_eq!(ctl.effective_max() as u64, PYRO_CEILING);
+        ctl.set_pyrowave(None);
+        assert!(ctl.effective_max() <= 200_000_000);
+    }
 
     #[test]
     fn the_frame_cap_holds_one_round_trip_plus_one() {

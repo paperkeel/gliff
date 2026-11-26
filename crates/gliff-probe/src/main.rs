@@ -146,6 +146,9 @@ enum Cmd {
         /// which a server treats as 60 Hz).
         #[arg(long, default_value_t = 0)]
         refresh: u32,
+        /// Offer PyroWave as well as H.264 (the server picks).
+        #[arg(long)]
+        pyrowave: bool,
         /// Ack frames without decoding them (server-side throughput only).
         #[arg(long)]
         no_decode: bool,
@@ -202,6 +205,11 @@ enum Cmd {
         /// Also report the PSNR of each plane.
         #[arg(long)]
         planes: bool,
+        /// Use the streaming path instead of CPU planes: gliff's Vulkan
+        /// device shared with PyroWave, the picture encoded from a GPU image
+        /// and decoded through the display shader.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Micro-benchmark the CPU colour/split reference the GPU shaders replace
     Bench {
@@ -276,6 +284,7 @@ fn main() -> Result<()> {
             width,
             height,
             refresh,
+            pyrowave,
             no_decode,
             csv,
             timeline,
@@ -284,6 +293,7 @@ fn main() -> Result<()> {
             &connect,
             seconds,
             (width, height, refresh),
+            pyrowave,
             no_decode,
             csv.as_deref(),
             timeline,
@@ -299,8 +309,19 @@ fn main() -> Result<()> {
             bpp,
             fps,
             frames,
+            gpu: true,
+            ..
+        } => pyrowave_gpu(&node, png.as_deref(), (width, height), &bpp, fps, frames)?,
+        Cmd::Pyrowave {
+            png,
+            width,
+            height,
+            bpp,
+            fps,
+            frames,
             yuv420,
             planes,
+            gpu: false,
         } => pyrowave(
             png.as_deref(),
             (width, height),
@@ -668,7 +689,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
             VideoMode::Gpu => Some(Gpu::open(Some(node))?),
             VideoMode::Cpu => None,
         };
-        let mut decoder = serve_decoder(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
+        let mut decoder = serve_decoder(&gpu, gliff_proto::Codec::H264, chroma != ChromaMode::Single420, w as u32, h as u32)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
@@ -778,7 +799,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     // A pace-only reconfig comes without a keyframe; reset
                     // the decoder only when the coded stream changes.
                     if (width as usize, height as usize, c) != (w, h, chroma) {
-                        decoder = serve_decoder(&gpu, c != ChromaMode::Single420, width, height)?;
+                        decoder = serve_decoder(&gpu, gliff_proto::Codec::H264, c != ChromaMode::Single420, width, height)?;
                     }
                     w = width as usize; h = height as usize; chroma = c;
                     eprintln!("  reconfig to {w}x{h} scale {scale_milli}");
@@ -917,6 +938,7 @@ fn stream_bench(
     addr: &str,
     seconds: f64,
     (width, height, refresh): (u32, u32, u32),
+    offer_pyrowave: bool,
     no_decode: bool,
     csv: Option<&std::path::Path>,
     timeline: bool,
@@ -941,22 +963,28 @@ fn stream_bench(
         let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
-        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
+        // A CPU decoder cannot take PyroWave; without decoding, any codec goes.
+        let pyrowave_ok = no_decode || video == VideoMode::Gpu;
+        if offer_pyrowave && !pyrowave_ok {
+            bail!("--pyrowave needs the GPU pipeline (or --no-decode)");
+        }
+        let codecs = if offer_pyrowave { vec![Codec::H264, Codec::PyroWave] } else { vec![Codec::H264] };
+        let caps = ClientCaps { codecs, max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
         writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
         milestone("hello_ack");
         // A Ping may arrive before the StreamConfig; answer it right away
         // (it seeds the server's round-trip estimate).
-        let (mut w, mut h, mut chroma) = loop {
+        let (mut w, mut h, mut chroma, mut codec) = loop {
             match reader.read_msg::<ServerMsg>().await? {
                 ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
-                ServerMsg::StreamConfig { width, height, chroma, .. } => break (width, height, chroma),
+                ServerMsg::StreamConfig { width, height, chroma, codec, .. } => break (width, height, chroma, codec),
                 o => bail!("expected StreamConfig, got {o:?}"),
             }
         };
         milestone("stream_config");
-        println!("  connected: headless={} output={} stream {w}x{h} {chroma:?}", session.headless, session.output);
+        println!("  connected: headless={} output={} stream {w}x{h} {chroma:?} {codec:?}", session.headless, session.output);
         if width > 0 && height > 0 {
             let refresh_mhz = (refresh > 0).then_some(refresh * 1000);
             writer.write_msg(&ClientMsg::Resize { width, height, scale: 1.0, refresh_mhz }).await?;
@@ -965,7 +993,7 @@ fn stream_bench(
             VideoMode::Gpu => Some(Gpu::open(Some(node))?),
             VideoMode::Cpu => None,
         };
-        let mut decoder = if no_decode { None } else { Some(serve_decoder(&gpu, chroma != ChromaMode::Single420, w, h)?) };
+        let mut decoder = if no_decode { None } else { Some(serve_decoder(&gpu, codec, chroma != ChromaMode::Single420, w, h)?) };
         let mut csv_out = match csv { Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)), None => None };
         if let Some(c) = csv_out.as_mut() { writeln!(c, "t_ms,frame_id,key,bytes,latency_ms,decode_ms")?; }
 
@@ -1084,14 +1112,14 @@ fn stream_bench(
                         writeln!(c, "{:.1},{frame_id},{},{total},{lat_recv:.2},{dec:.2}", arrived.duration_since(start).as_secs_f64() * 1000.0, keyframe as u8)?;
                     }
                 }
-                ServerMsg::StreamConfig { width, height, chroma: c, scale_milli, fps_cap, .. } => {
+                ServerMsg::StreamConfig { width, height, chroma: c, codec: k, scale_milli, fps_cap, .. } => {
                     // A pace-only reconfig comes without a keyframe; reset
                     // the decoder only when the coded stream changes.
-                    if (width, height, c) != (w, h, chroma) {
-                        if decoder.is_some() { decoder = Some(serve_decoder(&gpu, c != ChromaMode::Single420, width, height)?); }
+                    if (width, height, c, k) != (w, h, chroma, codec) {
+                        if decoder.is_some() { decoder = Some(serve_decoder(&gpu, k, c != ChromaMode::Single420, width, height)?); }
                         last_arrival = None;
                     }
-                    w = width; h = height; chroma = c;
+                    w = width; h = height; chroma = c; codec = k;
                     reconfigs += 1;
                     bucket(Instant::now(), 3, 1);
                     milestone("reconfig");
@@ -1607,11 +1635,15 @@ enum ProbeDecoder {
 
 fn serve_decoder(
     gpu: &Option<std::sync::Arc<Gpu>>,
+    codec: gliff_proto::Codec,
     dual: bool,
     width: u32,
     height: u32,
 ) -> Result<ProbeDecoder> {
     Ok(match gpu {
+        Some(gpu) if codec == gliff_proto::Codec::PyroWave => {
+            ProbeDecoder::Gpu(Box::new(Decoder::new_pyrowave(gpu, width, height)?))
+        }
         Some(gpu) => ProbeDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
         None => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual, width, height)?)),
     })
@@ -2088,4 +2120,68 @@ fn pyrowave(
 
 fn yuv444_like(w: u32, h: u32) -> gliff_proto::Yuv444 {
     gliff_proto::Yuv444::new(w as usize, h as usize)
+}
+
+/// The streaming path: gliff-vk's PyroWave encoder and decoder on one
+/// shared device, BGRA in and BGRA out.
+fn pyrowave_gpu(
+    node: &std::path::Path,
+    png: Option<&std::path::Path>,
+    size: (u32, u32),
+    bpps: &[f64],
+    fps: u32,
+    frames: usize,
+) -> Result<()> {
+    use gliff_proto::color::psnr;
+    use gliff_vk::{Decoder, Encoder, EncoderSettings, Gpu};
+    use std::time::Instant;
+    let (source, w, h) = match png {
+        Some(path) => load_png_bgra(path)?,
+        None => (test_card(size.0, size.1), size.0, size.1),
+    };
+    let gpu = Gpu::open(Some(node))?;
+    if let Err(e) = gpu.pyrowave_available() {
+        bail!("PyroWave unavailable on {}: {e}", gpu.name);
+    }
+    println!("PASS PyroWave shares the Vulkan device ({})", gpu.name);
+    let pixels = w as f64 * h as f64;
+    let mut dec = Decoder::new_pyrowave(&gpu, w, h)?;
+    println!("  bpp   KiB/frame  Mbit/s@{fps}  encode ms  decode ms  RGB PSNR dB");
+    for &bpp in bpps {
+        let bitrate = (pixels * bpp * fps as f64).min(u32::MAX as f64) as u32;
+        let settings = EncoderSettings {
+            width: w,
+            height: h,
+            bitrate,
+            framerate: fps,
+            vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
+        };
+        let mut enc = Encoder::new_pyrowave(&gpu, settings)?;
+        let (mut enc_ms, mut dec_ms, mut bytes, mut out) = (Vec::new(), Vec::new(), 0, Vec::new());
+        for _ in 0..frames.max(1) {
+            let t = Instant::now();
+            let frame = enc.encode_bgra(&source, false)?;
+            enc_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            bytes = frame.main.len();
+            let t = Instant::now();
+            out = dec
+                .decode_to_bgra(&frame.main, &[])?
+                .context("decoder produced no picture")?;
+            dec_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!(
+            "  {bpp:<4}  {:>9.0}  {:>11.0}  {:>9.2}  {:>9.2}  {:>11.1}",
+            bytes as f64 / 1024.0,
+            bytes as f64 * 8.0 * fps as f64 / 1e6,
+            median(&mut enc_ms),
+            median(&mut dec_ms),
+            psnr(&source, &out),
+        );
+    }
+    println!("  (encode ms includes uploading the BGRA picture; decode ms reading it back)");
+    Ok(())
 }

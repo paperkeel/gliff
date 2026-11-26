@@ -818,6 +818,7 @@ dependencies = [
  "ash",
  "drm-fourcc",
  "gliff-proto",
+ "gliff-pyrowave",
  "gliff-va",
  "thiserror",
  "tracing",

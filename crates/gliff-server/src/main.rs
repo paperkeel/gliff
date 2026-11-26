@@ -68,6 +68,18 @@ struct Cli {
     /// own refresh rate.
     #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(10..=500))]
     max_fps: u32,
+    /// Video codec: `auto` uses PyroWave when the client supports it and
+    /// reached this server over a direct LAN address (SSH_CONNECTION),
+    /// H.264 otherwise; `h264` never uses PyroWave; `pyrowave` uses it
+    /// whenever the client supports it (development and benchmarks).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "h264", "pyrowave"])]
+    codec: String,
+    /// PyroWave's bits per pixel per frame when the link has room. Each
+    /// frame crosses the link before it is shown, so this trades sharpness
+    /// for latency: at 4K, 1.5 is ~1.5 MB (~5 ms on 2.5 GbE) and ~47 dB on
+    /// desktop text; 2 is ~52 dB; 1 is ~42 dB.
+    #[arg(long, default_value_t = 1.5)]
+    pyrowave_bpp: f64,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
     /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
     /// the GLIFF_VIDEO environment variable.
@@ -128,6 +140,12 @@ fn main() -> Result<()> {
         bitrate: cli.bitrate,
         max_stream: cli.max_stream,
         max_fps: cli.max_fps,
+        codec: match cli.codec.as_str() {
+            "h264" => session::CodecChoice::H264,
+            "pyrowave" => session::CodecChoice::PyroWave,
+            _ => session::CodecChoice::Auto,
+        },
+        pyrowave_bpp: cli.pyrowave_bpp.clamp(0.3, 8.0),
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),

@@ -141,8 +141,21 @@ less sharp. A mirrored screen is scaled down to the limit.
 **High refresh rates.** The client reports the refresh rate of the monitor
 that shows the window. A private screen runs at that rate, up to the
 server's `--max-fps` (240 by default). A mirrored screen also stays within
-its own rate. On the hardware above, a 150 Hz client gets about 105 fps at
-4K, where encode and decode set the limit, and about 130 fps at 2560x1440.
+its own rate. With H.264, a 150 Hz client gets about 105 fps at 4K, where
+encode and decode set the limit, and about 130 fps at 2560x1440.
+
+**PyroWave on a LAN.** When the client reaches the server over a direct LAN
+address, gliff uses [PyroWave](https://github.com/Themaister/pyrowave)
+instead of H.264. PyroWave is an intra-only wavelet codec in Vulkan compute.
+It sends 4:4:4 at about 1.5 bits per pixel, which is 10 to 35 times the H.264
+bitrate. In exchange, a 4K frame encodes in about 2.5 ms and decodes in
+about 4.5 ms on a Ryzen 5 7640U (H.264: 6.3 ms and 8.3 ms). With PyroWave, a
+4K stream reaches 148 fps at 150 Hz. Over Tailscale or the internet, gliff
+stays on H.264. `gliff-server --codec h264|pyrowave|auto` overrides the
+choice, and `--pyrowave-bpp` trades sharpness for latency, because each
+frame must cross the link before it is shown. Both ends need
+`libpyrowave-shared.so` (`scripts/build-pyrowave.sh`; the package installs
+it).
 
 ## If something does not work
 

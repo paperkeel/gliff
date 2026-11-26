@@ -76,6 +76,12 @@ pub enum Codec {
     H265,
     #[n(3)]
     Av1,
+    /// PyroWave: intra-only wavelet frames, full 4:4:4, in one payload.
+    /// A server sends it only to a client that lists it. gliff-server's
+    /// automatic choice takes it only on a direct LAN path; `--codec
+    /// pyrowave` forces it wherever the client and the GPU support it.
+    #[n(4)]
+    PyroWave,
 }
 
 /// Which pipeline encodes or decodes on one end, reported for the stats
