@@ -24,6 +24,7 @@ gliff-proto.workspace = true
 gliff-vk.workspace = true
 gliff-va.workspace = true
 gliff-sw.workspace = true
+gliff-pyrowave.workspace = true
 drm-fourcc.workspace = true
 tokio.workspace = true
 bytes.workspace = true

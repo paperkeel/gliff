@@ -23,7 +23,7 @@ depends=(
   'vulkan-icd-loader'
   'wayland'
 )
-makedepends=('cargo' 'pkgconf' 'nasm')
+makedepends=('cargo' 'pkgconf' 'nasm' 'cmake' 'git' 'vulkan-headers')
 optdepends=('vulkan-radeon: Vulkan compute on AMD'
             'vulkan-intel: Vulkan compute on Intel'
             'intel-media-driver: VA-API H.264 codec on Intel'
@@ -36,6 +36,8 @@ sha256sums=()
 build() {
   cd "$startdir/.."
   ./bin/build
+  # PyroWave, the LAN-only codec; gliff loads it at run time if present.
+  ./scripts/build-pyrowave.sh
 }
 
 package() {
@@ -44,6 +46,8 @@ package() {
   install -Dm755 target/release/gliff "$pkgdir/usr/bin/gliff"
   install -Dm755 target/release/gliff-server "$pkgdir/usr/bin/gliff-server"
   install -Dm755 target/release/gliff-probe "$pkgdir/usr/bin/gliff-probe"
+  install -d "$pkgdir/usr/lib/gliff"
+  cp -P target/pyrowave/lib/libpyrowave-shared.so* "$pkgdir/usr/lib/gliff/"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
   install -Dm644 pkgbuild/gliff.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/gliff.svg"

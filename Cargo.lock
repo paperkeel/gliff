@@ -720,6 +720,7 @@ dependencies = [
  "clap",
  "drm-fourcc",
  "gliff-proto",
+ "gliff-pyrowave",
  "gliff-sw",
  "gliff-transport",
  "gliff-va",
@@ -743,6 +744,15 @@ dependencies = [
  "proptest",
  "rayon",
  "thiserror",
+]
+
+[[package]]
+name = "gliff-pyrowave"
+version = "0.4.3"
+dependencies = [
+ "libloading",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
