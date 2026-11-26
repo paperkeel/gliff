@@ -216,23 +216,35 @@ impl Device {
         Ok(device)
     }
 
-    /// Record PyroWave's commands into `cmd` (a raw VkCommandBuffer of a
-    /// compute queue) while `f` runs, instead of submitting them itself.
-    /// The caller submits `cmd` and waits for it before packetizing an
-    /// encode or using a decode.
-    pub fn record<T>(&self, cmd: *mut c_void, f: impl FnOnce() -> T) -> T {
-        // SAFETY: cmd is in the recording state for the duration of f.
+    /// Record PyroWave's commands into `cmd` while `f` runs, instead of
+    /// submitting them itself. The caller submits `cmd` and waits for it
+    /// before packetizing an encode or using a decode. The command buffer
+    /// is unset again when `f` returns or unwinds.
+    ///
+    /// # Safety
+    /// `cmd` must be a live VkCommandBuffer of the device this PyroWave
+    /// device shares, for a compute-capable queue, in the recording state,
+    /// with no other host access while `f` runs.
+    pub unsafe fn record<T>(&self, cmd: *mut c_void, f: impl FnOnce() -> T) -> T {
+        struct Unset<'a>(&'a Device);
+        impl Drop for Unset<'_> {
+            fn drop(&mut self) {
+                // SAFETY: a null handle ends the borrowing of the caller's
+                // command buffer; the device is live.
+                unsafe {
+                    self.0
+                        .api()
+                        .pyrowave_device_set_command_buffer(self.0.raw, std::ptr::null_mut())
+                };
+            }
+        }
+        // SAFETY: the caller guarantees cmd per this function's contract.
         unsafe {
             self.api()
                 .pyrowave_device_set_command_buffer(self.raw, cmd as pw::VkCommandBuffer)
         };
-        let out = f();
-        // SAFETY: as above; a null handle ends the borrowing.
-        unsafe {
-            self.api()
-                .pyrowave_device_set_command_buffer(self.raw, std::ptr::null_mut())
-        };
-        out
+        let _unset = Unset(self);
+        f()
     }
 
     pub fn new(lib: &Arc<Library>) -> Result<Arc<Self>> {
@@ -491,7 +503,12 @@ impl Encoder {
     /// size and converted to full-range BT.709 YCbCr, into the command
     /// buffer set with [`Device::record`]. Submit and wait for it before
     /// [`Encoder::packetize`].
-    pub fn encode_gpu(&mut self, input: &ImageView, max_bytes: usize) -> Result<()> {
+    ///
+    /// # Safety
+    /// Call inside [`Device::record`]. `input` must name a live image of the
+    /// shared device, created with SAMPLED usage, in the stated layout, and
+    /// kept alive and unchanged until the recorded work completes.
+    pub unsafe fn encode_gpu(&mut self, input: &ImageView, max_bytes: usize) -> Result<()> {
         let info = pw::pyrowave_scaled_encode_info {
             view: input.raw(),
             input_color_space: pw::VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
@@ -509,8 +526,9 @@ impl Encoder {
             maximum_bitstream_size: max_bytes,
         };
         self.budget = max_bytes;
-        // SAFETY: the view names a live image in the stated layout; sync is
-        // left to the caller's command buffer (both sync operations null).
+        // SAFETY: the caller guarantees the image per this function's
+        // contract; sync is left to the caller's command buffer (both sync
+        // operations null).
         check("pyrowave_encoder_encode_gpu_scaled", unsafe {
             self.device.api().pyrowave_encoder_encode_gpu_scaled(
                 self.raw,
@@ -635,14 +653,19 @@ impl Decoder {
     }
 
     /// Record a decode of the queued picture into three single-channel
-    /// images (Y, Cb, Cr, STORAGE usage, GENERAL layout) into the command
-    /// buffer set with [`Device::record`].
-    pub fn decode_gpu(&mut self, planes: &[ImageView; 3]) -> Result<()> {
+    /// images (Y, Cb, Cr) into the command buffer set with
+    /// [`Device::record`].
+    ///
+    /// # Safety
+    /// Call inside [`Device::record`]. Each view must name a live image of
+    /// the shared device, created with STORAGE usage, in GENERAL layout, of
+    /// the decoder's size, and kept alive until the recorded work completes.
+    pub unsafe fn decode_gpu(&mut self, planes: &[ImageView; 3]) -> Result<()> {
         let buffers = pw::pyrowave_gpu_buffers {
             planes: [planes[0].raw(), planes[1].raw(), planes[2].raw()],
         };
-        // SAFETY: the views name live images in GENERAL layout; sync is left
-        // to the caller's command buffer.
+        // SAFETY: the caller guarantees the images per this function's
+        // contract; sync is left to the caller's command buffer.
         check("pyrowave_decoder_decode_gpu_buffer", unsafe {
             self.device.api().pyrowave_decoder_decode_gpu_buffer(
                 self.raw,

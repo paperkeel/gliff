@@ -393,6 +393,12 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     }
     match Gpu::open(Some(&hypr_capture::render_node(None))) {
         Ok(gpu) if gpu.can_decode() => Some(gpu),
+        // Without a VA-API H.264 decoder the GPU still decodes PyroWave;
+        // an H.264 stream then falls back to the CPU in new_decoder.
+        Ok(gpu) if gpu.pyrowave_available().is_ok() => {
+            tracing::warn!(gpu = %gpu.name, "no VA-API H.264 decoder; H.264 decodes on the CPU, PyroWave on the GPU");
+            Some(gpu)
+        }
         Ok(gpu) => {
             tracing::warn!(gpu = %gpu.name, "no VA-API H.264 decoder; falling back to the CPU pipeline");
             None

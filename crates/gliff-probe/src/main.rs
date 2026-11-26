@@ -963,6 +963,11 @@ fn stream_bench(
         let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
+        // A CPU decoder cannot take PyroWave; without decoding, any codec goes.
+        let pyrowave_ok = no_decode || video == VideoMode::Gpu;
+        if offer_pyrowave && !pyrowave_ok {
+            bail!("--pyrowave needs the GPU pipeline (or --no-decode)");
+        }
         let codecs = if offer_pyrowave { vec![Codec::H264, Codec::PyroWave] } else { vec![Codec::H264] };
         let caps = ClientCaps { codecs, max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
         writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
@@ -2135,7 +2140,7 @@ fn pyrowave_gpu(
         None => (test_card(size.0, size.1), size.0, size.1),
     };
     let gpu = Gpu::open(Some(node))?;
-    if let Err(e) = gpu.pyrowave() {
+    if let Err(e) = gpu.pyrowave_available() {
         bail!("PyroWave unavailable on {}: {e}", gpu.name);
     }
     println!("PASS PyroWave shares the Vulkan device ({})", gpu.name);

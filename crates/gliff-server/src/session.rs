@@ -93,8 +93,10 @@ fn address_is_lan(addr: std::net::IpAddr) -> bool {
 }
 
 /// The codec for this session: PyroWave when it is allowed, the client
-/// lists it and can take one 4:4:4 stream, and the GPU shares its device
-/// with PyroWave; H.264 otherwise.
+/// lists it and can take one 4:4:4 stream, and the GPU can run it; H.264
+/// otherwise. `Auto` allows it only for a client on a direct LAN address;
+/// `--codec pyrowave` skips that check (development and benchmarks) but
+/// still needs the client's support and a working PyroWave on this GPU.
 fn choose_codec(choice: CodecChoice, caps: &ClientCaps, video: &VideoTier) -> Codec {
     let allowed = match choice {
         CodecChoice::H264 => false,
@@ -108,7 +110,7 @@ fn choose_codec(choice: CodecChoice, caps: &ClientCaps, video: &VideoTier) -> Co
         return Codec::H264;
     }
     match video {
-        VideoTier::Gpu(gpu) => match gpu.pyrowave() {
+        VideoTier::Gpu(gpu) => match gpu.pyrowave_available() {
             Ok(_) => Codec::PyroWave,
             Err(e) => {
                 tracing::info!(error = %e, "PyroWave unavailable; using H.264");
@@ -211,13 +213,15 @@ where
     let start_fps = ladder.level().fps_cap.min(DEFAULT_FPS);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
-    let started = match VideoStart::open(video.clone(), &cfg, &caps, &output, fps_cmd, codec) {
+    let mut started = VideoStart::open(video.clone(), &cfg, &caps, &output, fps_cmd, codec);
+    if let (Err(e), Codec::PyroWave) = (&started, codec) {
+        tracing::warn!(error = %format!("{e:#}"), "cannot start PyroWave; using H.264");
+        codec = Codec::H264;
+        started = VideoStart::open(video, &cfg, &caps, &output, fps_cmd, codec);
+    }
+    // Then the GPU-to-CPU fallback, for H.264 started either way.
+    let started = match started {
         Ok(start) => Ok(start),
-        Err(e) if codec == Codec::PyroWave => {
-            tracing::warn!(error = %format!("{e:#}"), "cannot start PyroWave; using H.264");
-            codec = Codec::H264;
-            VideoStart::open(video, &cfg, &caps, &output, fps_cmd, codec)
-        }
         Err(e) if on_gpu => {
             tracing::warn!(error = %format!("{e:#}"), "cannot start the GPU video pipeline; falling back to the CPU pipeline");
             VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd, codec)
@@ -851,6 +855,15 @@ impl Session {
         }
         tracing::info!(fps, "frame-rate ceiling");
         self.max_fps = fps;
+        // The bitrate bounds scale with the fps ceiling; apply_stream_params
+        // only reconfigures them when the stream geometry changes.
+        let streams = if self.chroma == ChromaMode::Dual420 {
+            2
+        } else {
+            1
+        };
+        self.ctl
+            .reconfigure(self.stream.0 as u64 * self.stream.1 as u64, streams, fps);
         if self.apply_stream_params()? {
             self.send_config();
         }
@@ -1268,6 +1281,27 @@ impl Session {
     /// Refit the stream for CPU encoding and notify the client before its
     /// first CPU frame. Used both for a failed first GPU encode and when a
     /// later capture-ring allocation falls back to shared memory.
+    /// Leave PyroWave for H.264 on the same GPU, and tell the client, whose
+    /// decoder follows the codec in the StreamConfig.
+    fn fall_back_to_h264(&mut self) -> Result<()> {
+        self.codec = Codec::H264;
+        self.ctl.set_pyrowave(None);
+        self.base_chroma = if self.caps.chroma.contains(&ChromaMode::Dual420) {
+            ChromaMode::Dual420
+        } else {
+            ChromaMode::Single420
+        };
+        // Force the rebuild even when the chroma stays the same.
+        self.stream = (0, 0);
+        anyhow::ensure!(
+            self.apply_stream_params()?,
+            "cannot start H.264 after PyroWave"
+        );
+        self.want_keyframe = true;
+        self.send_config();
+        Ok(())
+    }
+
     fn fall_back_to_cpu(&mut self) -> Result<()> {
         self.video = VideoTier::Cpu;
         if self.codec == Codec::PyroWave {
@@ -1334,6 +1368,14 @@ impl Session {
         let t0 = Instant::now();
         let encoded = match self.encoder.encode(frame, self.stream, key) {
             Ok(e) => e,
+            Err(e) if self.codec == Codec::PyroWave => {
+                // For example an output that became rotated: PyroWave has no
+                // transform. Keep the session on H.264; this frame is
+                // dropped and the next capture goes out as H.264.
+                tracing::warn!(error = %format!("{e:#}"), "PyroWave encode failed; switching to H.264");
+                self.fall_back_to_h264()?;
+                return Ok(None);
+            }
             Err(e) if matches!(self.video, VideoTier::Gpu(_)) && !self.gpu_encoded => {
                 tracing::warn!(error = %format!("{e:#}"), "the first GPU encode failed; falling back to the CPU pipeline");
                 self.fall_back_to_cpu()?;

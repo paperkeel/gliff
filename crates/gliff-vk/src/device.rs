@@ -80,6 +80,8 @@ pub struct Gpu {
     pyro_share: Option<PyroShare>,
     /// The shared PyroWave device, made on first use.
     pyrowave: OnceLock<std::result::Result<Arc<gliff_pyrowave::Device>, String>>,
+    /// Whether a PyroWave encoder and decoder could be made, tested once.
+    pyrowave_works: OnceLock<std::result::Result<(), String>>,
     _entry: ash::Entry,
 }
 
@@ -350,6 +352,7 @@ impl Gpu {
                 foreign_family,
                 pyro_share,
                 pyrowave: OnceLock::new(),
+                pyrowave_works: OnceLock::new(),
                 families,
                 instance,
                 physical,
@@ -360,9 +363,28 @@ impl Gpu {
         }
     }
 
+    /// Whether PyroWave streams on this GPU: the library loads, the device
+    /// has the features, and a small encoder and decoder can be made (the
+    /// same checks the codec objects run). Tested once.
+    pub fn pyrowave_available(&self) -> std::result::Result<(), String> {
+        self.pyrowave_works
+            .get_or_init(|| {
+                let device = self.pyrowave()?;
+                let chroma = gliff_pyrowave::Chroma::Yuv444;
+                gliff_pyrowave::Encoder::new(&device, 64, 64, chroma)
+                    .map_err(|e| format!("PyroWave encoder: {e}"))?;
+                gliff_pyrowave::Decoder::new(&device, 64, 64, chroma)
+                    .map_err(|e| format!("PyroWave decoder: {e}"))?;
+                Ok(())
+            })
+            .clone()
+    }
+
     /// The PyroWave device sharing this one, made on first use. Fails when
-    /// the library is not installed or the GPU lacks the features.
-    pub fn pyrowave(&self) -> std::result::Result<Arc<gliff_pyrowave::Device>, String> {
+    /// the library is not installed or the GPU lacks the features. Crate
+    /// private: every holder of the handle also holds an `Arc<Gpu>`, so the
+    /// Vulkan device outlives it.
+    pub(crate) fn pyrowave(&self) -> std::result::Result<Arc<gliff_pyrowave::Device>, String> {
         self.pyrowave
             .get_or_init(|| {
                 let share = self
@@ -625,6 +647,9 @@ pub(crate) struct Commands {
     cmd: vk::CommandBuffer,
     pub(crate) queue: vk::Queue,
     fence: vk::Fence,
+    /// The fence belongs to an accepted submission. A recording or submit
+    /// that fails leaves nothing to wait for.
+    submitted: std::cell::Cell<bool>,
 }
 
 impl Commands {
@@ -653,7 +678,21 @@ impl Commands {
             cmd,
             queue,
             fence,
+            submitted: std::cell::Cell::new(false),
         })
+    }
+
+    /// Wait for the last accepted submission, if any.
+    fn wait_submitted(&self) -> Result<()> {
+        if self.submitted.get() {
+            // SAFETY: valid fence of an accepted submission.
+            unsafe {
+                self.gpu
+                    .device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)?
+            };
+        }
+        Ok(())
     }
 
     /// Record with `f` and submit. Waits for `wait` (a timeline value) first
@@ -673,9 +712,8 @@ impl Commands {
         // signalled (`block`, or the wait below), so the command buffer is not
         // in flight when it is recycled. A reset returns it to the initial
         // state but does not free it, so it is allocated once, in `new`.
+        self.wait_submitted()?;
         unsafe {
-            dev.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            dev.reset_fences(&[self.fence])?;
             dev.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())?;
             dev.begin_command_buffer(
                 cmd,
@@ -708,7 +746,12 @@ impl Commands {
                 .wait_semaphore_infos(&waits)
                 .command_buffer_infos(&cmds)
                 .signal_semaphore_infos(&signals);
+            // Reset the fence only now, so a recording that failed above
+            // leaves no unsignalled fence behind to wait on.
+            self.submitted.set(false);
+            dev.reset_fences(&[self.fence])?;
             dev.queue_submit2(self.queue, &[submit], self.fence)?;
+            self.submitted.set(true);
             if block {
                 dev.wait_for_fences(&[self.fence], true, u64::MAX)?;
             }
@@ -717,24 +760,16 @@ impl Commands {
     }
 
     pub(crate) fn wait(&self) -> Result<()> {
-        // SAFETY: valid fence.
-        unsafe {
-            self.gpu
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)?
-        };
-        Ok(())
+        self.wait_submitted()
     }
 }
 
 impl Drop for Commands {
     fn drop(&mut self) {
-        // SAFETY: wait for in-flight work before destroying the pool.
+        // Wait for in-flight work before destroying the pool.
+        let _ = self.wait_submitted();
+        // SAFETY: no submission is in flight.
         unsafe {
-            let _ = self
-                .gpu
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX);
             self.gpu.device.destroy_fence(self.fence, None);
             self.gpu.device.destroy_command_pool(self.pool, None);
         }

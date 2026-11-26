@@ -182,6 +182,10 @@ enum EncodeStage {
     Pyro {
         device: Arc<gliff_pyrowave::Device>,
         enc: gliff_pyrowave::Encoder,
+        /// Test hook (`GLIFF_TEST_PYROWAVE_FAIL_AFTER`): fail after this
+        /// many frames, to exercise the server's fallback to H.264.
+        fail_after: Option<u64>,
+        frames: u64,
     },
 }
 
@@ -235,7 +239,14 @@ impl Encoder {
             gpu: gpu.clone(),
             timeline: Timeline::new(gpu)?,
             compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
-            stage: EncodeStage::Pyro { device, enc },
+            stage: EncodeStage::Pyro {
+                device,
+                enc,
+                fail_after: std::env::var("GLIFF_TEST_PYROWAVE_FAIL_AFTER")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                frames: 0,
+            },
             imports: HashMap::new(),
             settings,
         })
@@ -328,18 +339,28 @@ impl Encoder {
         let t0 = std::time::Instant::now();
         let (split, main_stream, aux_stream) = match &mut self.stage {
             EncodeStage::H264 { split, main, aux } => (split, main, aux),
-            EncodeStage::Pyro { device, enc } => {
+            EncodeStage::Pyro {
+                device,
+                enc,
+                fail_after,
+                frames,
+            } => {
+                *frames += 1;
+                if fail_after.is_some_and(|n| *frames > n) {
+                    return Err(Error::Unsupported("GLIFF_TEST_PYROWAVE_FAIL_AFTER".into()));
+                }
                 if transform != 0 {
                     return Err(Error::Unsupported(
                         "PyroWave cannot undo an output transform".into(),
                     ));
                 }
                 // The exact per-frame budget: the bitrate spread over the
-                // frame rate.
+                // frame rate. The rate controller keeps it far above
+                // PyroWave's minimum (0.3 bits per pixel).
                 let budget = (u64::from(self.settings.bitrate)
                     / u64::from(self.settings.framerate.max(1))
                     / 8)
-                .max(4096) as usize;
+                .max(1) as usize;
                 let view = gliff_pyrowave::ImageView {
                     image: vk::Handle::as_raw(src.image),
                     width: src.width,
@@ -353,7 +374,12 @@ impl Encoder {
                     .run(self.timeline.semaphore, None, None, true, |cmd| {
                         src.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                         let raw = vk::Handle::as_raw(cmd) as usize as *mut std::ffi::c_void;
-                        encoded = device.record(raw, || enc.encode_gpu(&view, budget));
+                        // SAFETY: cmd is this device's compute command buffer,
+                        // recording, used by this thread only; src is a live
+                        // SAMPLED import of this device, now in
+                        // SHADER_READ_ONLY_OPTIMAL, and `run` blocks until the
+                        // work completes.
+                        encoded = unsafe { device.record(raw, || enc.encode_gpu(&view, budget)) };
                         Ok(())
                     })?;
                 encoded?;
@@ -539,7 +565,7 @@ impl Decoder {
     /// Whether PyroWave can decode on this GPU (the library loads and the
     /// device has the features).
     pub fn pyrowave_available(gpu: &Gpu) -> bool {
-        gpu.pyrowave().is_ok()
+        gpu.pyrowave_available().is_ok()
     }
 
     fn with_stage(gpu: &Arc<Gpu>, stage: DecodeStage, width: u32, height: u32) -> Result<Self> {
@@ -867,7 +893,11 @@ impl Decoder {
                     p.transition(cmd, vk::ImageLayout::GENERAL);
                 }
                 let raw = vk::Handle::as_raw(cmd) as usize as *mut std::ffi::c_void;
-                decoded = device.record(raw, || dec.decode_gpu(&views));
+                // SAFETY: cmd is this device's compute command buffer,
+                // recording, used by this thread only; the planes are live
+                // STORAGE images of this device at the decoder's size, now in
+                // GENERAL, and `run` blocks until the work completes.
+                decoded = unsafe { device.record(raw, || dec.decode_gpu(&views)) };
                 for p in planes.iter() {
                     p.transition(cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
