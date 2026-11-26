@@ -708,11 +708,12 @@ impl Commands {
     ) -> Result<()> {
         let dev = &self.gpu.device;
         let cmd = self.cmd;
-        // SAFETY: the pool is reset only after the previous submission's fence
-        // signalled (`block`, or the wait below), so the command buffer is not
-        // in flight when it is recycled. A reset returns it to the initial
-        // state but does not free it, so it is allocated once, in `new`.
         self.wait_submitted()?;
+        // SAFETY: the pool is reset only after the previous accepted
+        // submission's fence signalled (the wait above), so the command
+        // buffer is not in flight when it is recycled. A reset returns it to
+        // the initial state but does not free it, so it is allocated once,
+        // in `new`.
         unsafe {
             dev.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())?;
             dev.begin_command_buffer(
