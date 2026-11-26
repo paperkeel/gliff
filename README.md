@@ -150,7 +150,10 @@ instead of H.264. PyroWave is an intra-only wavelet codec in Vulkan compute.
 It sends 4:4:4 at about 1.5 bits per pixel, which is 10 to 35 times the H.264
 bitrate. In exchange, a 4K frame encodes in about 2.5 ms and decodes in
 about 4.5 ms on a Ryzen 5 7640U (H.264: 6.3 ms and 8.3 ms). With PyroWave, a
-4K stream reaches 148 fps at 150 Hz. Over Tailscale or the internet, gliff
+4K stream reaches 148 fps at 150 Hz when the link carries it. Between two
+machines on 2.5 GbE, the one SSH channel carries about 750 Mbit/s, so a 4K
+150 Hz stream runs at about 110 fps; at 60 Hz it runs at full rate with
+3 ms of transfer per frame. Over Tailscale or the internet, gliff
 stays on H.264. `gliff-server --codec h264|pyrowave|auto` overrides the
 choice, and `--pyrowave-bpp` trades sharpness for latency, because each
 frame must cross the link before it is shown. Both ends need
