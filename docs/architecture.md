@@ -154,10 +154,22 @@ Every crate with `unsafe` documents the safety requirements at each block.
   at p50 and the stream ran at 57 fps. With the headroom, a 60 Hz source
   finds its slot open, waits 0 ms at p50, and runs at 59.5-59.9 fps. Sending is bounded by bytes in flight against
   `gain x delivered rate x base RTT` (never below two frames), not by an ack
-  count, so latency does not cap the frame rate and a slow client cannot
-  build a backlog. Frames are captured on demand, so a static screen costs
+  count, so latency does not cap the frame rate. A frame cap also applies:
+  the frames that one base round trip holds, plus one. Clients ack after
+  they decode, so on a LAN this allows one frame in the decoder and one on
+  the way. A client that decodes slower than the server sends cannot build
+  a queue, and a wait on this cap is not congestion for the rate
+  controller. Frames are captured on demand, so a static screen costs
   nothing; a request stays outstanding while sending is blocked, so the frame
-  that finally goes out is current.
+  that finally goes out is current. The server asks for the next frame
+  before it encodes the current one, so the compositor renders and copies
+  it during the encode. The ring holds the frame in the encoder, the last
+  frame and the next one.
+  The session fps ceiling follows the refresh rate that the client reports
+  with `Resize` (`refresh_mhz`), within `--max-fps`. A private screen runs at
+  that rate. At 150 Hz on an RX 7800 XT, a 4K stream ran at 104 fps and a
+  2560x1440 stream at 131 fps (nested Hyprland, decode on the same GPU). The
+  bitrate ceiling is 80 Mbit/s at 60 fps and grows with the fps ceiling.
   A separate writer task owns the socket write half and keeps at most one
   queued encoded frame; unsent cursor and pong messages are coalesced,
   clipboard messages are never coalesced (transfers are ordered and

@@ -142,6 +142,10 @@ enum Cmd {
         width: u32,
         #[arg(long, default_value_t = 0)]
         height: u32,
+        /// Report this monitor refresh rate in Hz with the resize (0 = none,
+        /// which a server treats as 60 Hz).
+        #[arg(long, default_value_t = 0)]
+        refresh: u32,
         /// Ack frames without decoding them (server-side throughput only).
         #[arg(long)]
         no_decode: bool,
@@ -243,6 +247,7 @@ fn main() -> Result<()> {
             seconds,
             width,
             height,
+            refresh,
             no_decode,
             csv,
             timeline,
@@ -250,7 +255,7 @@ fn main() -> Result<()> {
             &node,
             &connect,
             seconds,
-            (width, height),
+            (width, height, refresh),
             no_decode,
             csv.as_deref(),
             timeline,
@@ -715,7 +720,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                             writer.write_msg(&ClientMsg::Key { keycode, pressed: false }).await?;
                         }
                     }
-                    if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
+                    if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0, refresh_mhz: None }).await?; }
                     if got == 4 && (send_clip.is_some() || send_file.is_some() || !send_files.entries.is_empty()) {
                         let mut mime_types: Vec<String> = Vec::new();
                         if send_clip.is_some() { mime_types.extend(TEXT_MIMES.iter().map(|m| m.to_string())); }
@@ -865,7 +870,7 @@ fn stream_bench(
     node: &std::path::Path,
     addr: &str,
     seconds: f64,
-    size: (u32, u32),
+    (width, height, refresh): (u32, u32, u32),
     no_decode: bool,
     csv: Option<&std::path::Path>,
     timeline: bool,
@@ -906,8 +911,9 @@ fn stream_bench(
         };
         milestone("stream_config");
         println!("  connected: headless={} output={} stream {w}x{h} {chroma:?}", session.headless, session.output);
-        if size.0 > 0 && size.1 > 0 {
-            writer.write_msg(&ClientMsg::Resize { width: size.0, height: size.1, scale: 1.0 }).await?;
+        if width > 0 && height > 0 {
+            let refresh_mhz = (refresh > 0).then_some(refresh * 1000);
+            writer.write_msg(&ClientMsg::Resize { width, height, scale: 1.0, refresh_mhz }).await?;
         }
         let gpu = match video {
             VideoMode::Gpu => Some(Gpu::open(Some(node))?),

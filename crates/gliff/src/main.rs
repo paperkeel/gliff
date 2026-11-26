@@ -123,6 +123,8 @@ struct App {
     /// Size of the video widget in device pixels, rounded down to even.
     view_size: Cell<(u32, u32)>,
     view_scale: Cell<f64>,
+    /// Refresh of the window's monitor in mHz, polled with the size.
+    view_refresh: Cell<u32>,
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
     pressed_keys: RefCell<BTreeSet<u32>>,
@@ -178,6 +180,7 @@ struct Session {
     /// The size last asked of the server, so a pending resize is not repeated.
     resize_requested: Cell<(u32, u32)>,
     resize_scale: Cell<f64>,
+    resize_refresh: Cell<u32>,
     /// The output zoom last asked of the decoder; a new worker starts at 1.
     zoom: Cell<u32>,
     /// The latest frame and its view, painted when the tab is shown.
@@ -191,6 +194,7 @@ impl Session {
     fn reset_resize(&self) {
         self.resize_requested.set((0, 0));
         self.resize_scale.set(0.0);
+        self.resize_refresh.set(0);
     }
 
     fn new(endpoint: Endpoint) -> Self {
@@ -213,6 +217,7 @@ impl Session {
             stream_scale: Cell::new(1.0),
             resize_requested: Cell::new((0, 0)),
             resize_scale: Cell::new(0.0),
+            resize_refresh: Cell::new(0),
             zoom: Cell::new(1),
             last_frame: RefCell::new(None),
             cursor: RefCell::new(None),
@@ -417,6 +422,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         local_clipboard: RefCell::new(None),
         view_size: Cell::new((0, 0)),
         view_scale: Cell::new(1.0),
+        view_refresh: Cell::new(0),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
         config_path: Config::default_path(),
@@ -2151,7 +2157,9 @@ fn install_resize_handler(ui: &Rc<App>) {
             h.max(0.0).round() as u32 & !1,
         );
         let scale_changed = ui.view_scale.replace(scale) != scale;
-        if size != ui.view_size.get() || scale_changed {
+        let refresh = monitor_refresh_mhz(&ui);
+        let refresh_changed = ui.view_refresh.replace(refresh) != refresh;
+        if size != ui.view_size.get() || scale_changed || refresh_changed {
             ui.view_size.set(size);
             let ui = ui.clone();
             glib::timeout_add_local_once(Duration::from_millis(200), move || {
@@ -2198,21 +2206,25 @@ fn request_resize(ui: &App) {
     };
     let size = ui.view_size.get();
     let scale = device_scale(ui);
+    let refresh = monitor_refresh_mhz(ui);
     if size.0 < 64
         || size.1 < 64
         || (s.resize_scale.get() == scale
+            && s.resize_refresh.get() == refresh
             && (size == s.server_view.get() || size == s.resize_requested.get()))
     {
         return;
     }
     s.resize_requested.set(size);
     s.resize_scale.set(scale);
+    s.resize_refresh.set(refresh);
     send_to(
         &s,
         ClientMsg::Resize {
             width: size.0,
             height: size.1,
             scale: scale as f32,
+            refresh_mhz: (refresh > 0).then_some(refresh),
         },
     );
 }
@@ -2228,6 +2240,18 @@ fn evdev_button(n: u32) -> u32 {
         8.. => 0x110 + n - 5,
         _ => 0x110,
     }
+}
+
+/// Refresh rate of the monitor that shows the window, in mHz; 0 when GDK
+/// does not know it.
+fn monitor_refresh_mhz(ui: &App) -> u32 {
+    let Some(surface) = ui.window.surface() else {
+        return 0;
+    };
+    surface
+        .display()
+        .monitor_at_surface(&surface)
+        .map_or(0, |m| m.refresh_rate().max(0) as u32)
 }
 
 fn device_scale(ui: &App) -> f64 {

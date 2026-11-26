@@ -194,6 +194,11 @@ pub enum ClientMsg {
         height: u32,
         #[n(2)]
         scale: f32,
+        /// Refresh rate of the monitor that shows the window, in mHz. A
+        /// private screen runs at this rate (within the server's
+        /// `--max-fps`); older clients send none and get 60 Hz.
+        #[n(3)]
+        refresh_mhz: Option<u32>,
     },
     #[n(2)]
     Key {
