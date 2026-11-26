@@ -9,6 +9,7 @@ members = [
     "crates/hypr-input",
     "crates/gliff-va",
     "crates/gliff-vk",
+    "crates/gliff-pyrowave",
     "crates/gliff-sw",
     "crates/gliff",
     "crates/gliff-server",
@@ -36,6 +37,7 @@ hypr-capture = { path = "crates/hypr-capture" }
 hypr-input = { path = "crates/hypr-input" }
 gliff-va = { path = "crates/gliff-va" }
 gliff-vk = { path = "crates/gliff-vk" }
+gliff-pyrowave = { path = "crates/gliff-pyrowave" }
 gliff-sw = { path = "crates/gliff-sw" }
 openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"

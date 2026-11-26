@@ -24,6 +24,14 @@ without both, gliff uses the CPU tier. The compute shaders are committed as SPIR
 (`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`), and the
 libva bindings as bindgen output (`crates/gliff-va/bindings/gen.sh`).
 
+PyroWave, the codec for direct LAN sessions, is a separate C++ library that
+gliff loads at run time. `scripts/build-pyrowave.sh` clones it and the
+Granite parts it needs at pinned commits and builds
+`target/pyrowave/lib/libpyrowave-shared.so`. It needs git, cmake and the
+Vulkan headers. Without the library, gliff uses H.264 only. The package
+installs it in `/usr/lib/gliff/`. `gliff-probe pyrowave --png capture.png`
+measures size, speed and quality on a captured screen.
+
 Verify the machine first:
 
 ```

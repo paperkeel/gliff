@@ -175,6 +175,34 @@ enum Cmd {
         #[arg(long)]
         caps: Option<String>,
     },
+    /// Round-trip pictures through PyroWave (libpyrowave-shared.so, see
+    /// scripts/build-pyrowave.sh) at several bit budgets, and report the
+    /// frame size, the bandwidth, the times and the RGB PSNR
+    Pyrowave {
+        /// A PNG to encode, such as `gliff-probe capture` output. Without
+        /// it, a synthetic test card of --width x --height.
+        #[arg(long)]
+        png: Option<PathBuf>,
+        #[arg(long, default_value_t = 3840)]
+        width: u32,
+        #[arg(long, default_value_t = 2160)]
+        height: u32,
+        /// Bit budgets to try, in bits per pixel.
+        #[arg(long, value_delimiter = ',', default_value = "0.5,1,1.5,2,3,4")]
+        bpp: Vec<f64>,
+        /// Frame rate for the bandwidth column.
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+        /// Encodes and decodes per budget.
+        #[arg(long, default_value_t = 10)]
+        frames: usize,
+        /// Encode 4:2:0 instead of 4:4:4.
+        #[arg(long)]
+        yuv420: bool,
+        /// Also report the PSNR of each plane.
+        #[arg(long)]
+        planes: bool,
+    },
     /// Micro-benchmark the CPU colour/split reference the GPU shaders replace
     Bench {
         #[arg(long, default_value_t = 100)]
@@ -264,6 +292,24 @@ fn main() -> Result<()> {
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Keymap { secs, caps } => keymap(&target, secs, caps)?,
         Cmd::Bench { iters } => bench(iters)?,
+        Cmd::Pyrowave {
+            png,
+            width,
+            height,
+            bpp,
+            fps,
+            frames,
+            yuv420,
+            planes,
+        } => pyrowave(
+            png.as_deref(),
+            (width, height),
+            &bpp,
+            fps,
+            frames,
+            yuv420,
+            planes,
+        )?,
         Cmd::All => {
             protocols(&target)?;
             outputs(&target)?;
@@ -1838,4 +1884,208 @@ fn pipeline(
         bail!("pipeline PSNR too low");
     }
     Ok(())
+}
+
+/// A stress card: a gradient under dense, pseudo-random one-pixel coloured
+/// strokes over the whole frame. PyroWave a32b05e loses this picture's mean
+/// level at any budget (a real desktop capture is fine), so use --png for
+/// quality numbers; the card remains as a stress case.
+fn test_card(w: u32, h: u32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let mut px = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let mut c = [
+                (40 + x * 60 / w) as u8,
+                (30 + y * 40 / h) as u8,
+                (50 + (x + y) * 30 / (w + h)) as u8,
+            ];
+            if x > w / 2 && y < h / 3 {
+                c = [235, 235, 235];
+            }
+            let line = y % 18;
+            let glyph = (x / 7).wrapping_mul(2654435761) >> 7;
+            if (3..14).contains(&line) && x % 7 != 6 && glyph & 3 != 0 {
+                let stroke = (x * 3 + line * 5 + glyph) % 9 < 3;
+                if stroke {
+                    c = match (y / 18 + x / 400) % 4 {
+                        0 => [20, 20, 20],
+                        1 => [220, 60, 60],
+                        2 => [60, 180, 90],
+                        _ => [70, 110, 230],
+                    };
+                }
+            }
+            px[i..i + 4].copy_from_slice(&[c[2], c[1], c[0], 255]);
+        }
+    }
+    px
+}
+
+fn load_png_bgra(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32)> {
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)?;
+    let (w, h) = (info.width, info.height);
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => bail!("unsupported PNG colour type {other:?}"),
+    };
+    if info.bit_depth != png::BitDepth::Eight {
+        bail!("only 8-bit PNGs are supported");
+    }
+    let mut bgra = vec![255u8; w as usize * h as usize * 4];
+    for (i, px) in buf[..info.buffer_size()].chunks(channels).enumerate() {
+        bgra[i * 4] = px[2];
+        bgra[i * 4 + 1] = px[1];
+        bgra[i * 4 + 2] = px[0];
+    }
+    Ok((bgra, w, h))
+}
+
+fn pyrowave(
+    png: Option<&std::path::Path>,
+    size: (u32, u32),
+    bpps: &[f64],
+    fps: u32,
+    frames: usize,
+    yuv420: bool,
+    planes: bool,
+) -> Result<()> {
+    use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
+    use gliff_pyrowave::{Chroma, Decoder, Device, Encoder, Library, Planes, PlanesMut};
+    use std::time::Instant;
+    let (source, sw, sh) = match png {
+        Some(path) => load_png_bgra(path)?,
+        None => (test_card(size.0, size.1), size.0, size.1),
+    };
+    // Even sides, for 4:2:0.
+    let (w, h) = (sw & !1, sh & !1);
+    let bgra: Vec<u8> = source
+        .chunks(sw as usize * 4)
+        .take(h as usize)
+        .flat_map(|row| row[..w as usize * 4].to_vec())
+        .collect();
+    let lib = Library::load()?;
+    println!(
+        "PASS PyroWave {}.{}.{} from {}",
+        lib.version.0,
+        lib.version.1,
+        lib.version.2,
+        lib.path.display()
+    );
+    let device = Device::new(&lib)?;
+    let chroma = if yuv420 {
+        Chroma::Yuv420
+    } else {
+        Chroma::Yuv444
+    };
+    let yuv = bgra_to_yuv444(&bgra, w as usize * 4, w as usize, h as usize);
+    let reference = psnr(&bgra, &yuv444_to_bgra(&yuv));
+    println!(
+        "  {w}x{h} {chroma:?} {}; colour conversion alone: {reference:.1} dB",
+        if png.is_some() {
+            "picture"
+        } else {
+            "test card"
+        }
+    );
+    let subsample = |p: &[u8]| -> Vec<u8> {
+        let (cw, ch) = chroma.plane_size(1, w, h);
+        let mut out = vec![0u8; (cw * ch) as usize];
+        for y in 0..ch as usize {
+            for x in 0..cw as usize {
+                let at = |dx: usize, dy: usize| p[(y * 2 + dy) * w as usize + x * 2 + dx] as u32;
+                out[y * cw as usize + x] =
+                    ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+            }
+        }
+        out
+    };
+    let (cb, cr) = if yuv420 {
+        (subsample(&yuv.u), subsample(&yuv.v))
+    } else {
+        (yuv.u.clone(), yuv.v.clone())
+    };
+    let mut enc = Encoder::new(&device, w, h, chroma)?;
+    let mut dec = Decoder::new(&device, w, h, chroma)?;
+    let pixels = w as f64 * h as f64;
+    println!("  bpp   KiB/frame  Mbit/s@{fps}  encode ms  decode ms  RGB PSNR dB");
+    for &bpp in bpps {
+        let budget = (pixels * bpp / 8.0) as usize;
+        let (mut enc_ms, mut dec_ms, mut bytes) = (Vec::new(), Vec::new(), 0usize);
+        let mut out = yuv444_like(w, h);
+        let (mut ocb, mut ocr) = (vec![0u8; cb.len()], vec![0u8; cr.len()]);
+        device.performance_stats(true);
+        for _ in 0..frames.max(1) {
+            let t = Instant::now();
+            enc.encode_planes(
+                &Planes {
+                    y: &yuv.y,
+                    cb: &cb,
+                    cr: &cr,
+                },
+                budget,
+            )?;
+            let frame = enc.packetize(256 * 1024)?;
+            enc_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            bytes = frame.data.len();
+            let t = Instant::now();
+            if !dec.push_frame(&frame.data)? {
+                bail!("decoder reports an incomplete frame");
+            }
+            dec.decode_planes(&mut PlanesMut {
+                y: &mut out.y,
+                cb: &mut ocb,
+                cr: &mut ocr,
+            })?;
+            dec_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        if yuv420 {
+            let cw = w as usize / 2;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    out.u[y * w as usize + x] = ocb[(y / 2) * cw + x / 2];
+                    out.v[y * w as usize + x] = ocr[(y / 2) * cw + x / 2];
+                }
+            }
+        } else {
+            out.u = ocb;
+            out.v = ocr;
+        }
+        let quality = psnr(&bgra, &yuv444_to_bgra(&out));
+        if planes {
+            println!(
+                "        planes: Y {:.1} Cb {:.1} Cr {:.1} dB",
+                psnr(&yuv.y, &out.y),
+                psnr(&yuv.u, &out.u),
+                psnr(&yuv.v, &out.v),
+            );
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!(
+            "  {bpp:<4}  {:>9.0}  {:>11.0}  {:>9.2}  {:>9.2}  {quality:>11.1}",
+            bytes as f64 / 1024.0,
+            bytes as f64 * 8.0 * fps as f64 / 1e6,
+            median(&mut enc_ms),
+            median(&mut dec_ms),
+        );
+        for line in device.performance_stats(true) {
+            if !line.contains("Memory Heap") {
+                println!("        gpu {line}");
+            }
+        }
+    }
+    println!("  (encode and decode ms include copying the planes to and from the GPU)");
+    Ok(())
+}
+
+fn yuv444_like(w: u32, h: u32) -> gliff_proto::Yuv444 {
+    gliff_proto::Yuv444::new(w as usize, h as usize)
 }
