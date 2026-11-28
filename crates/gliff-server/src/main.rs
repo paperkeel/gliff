@@ -80,6 +80,13 @@ struct Cli {
     /// desktop text; 2 is ~52 dB; 1 is ~42 dB.
     #[arg(long, default_value_t = 1.5)]
     pyrowave_bpp: f64,
+    /// PyroWave's bits per pixel for one sharp copy of the screen once it
+    /// stops changing (80 ms after the last frame), so text is crisp when
+    /// you stop typing or scrolling. 6 lets the codec use what the content
+    /// needs (near lossless, ~2.8 MB for a 4K desktop of code); 0 sends no
+    /// sharp copy.
+    #[arg(long, default_value_t = 6.0)]
+    pyrowave_still_bpp: f64,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
     /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
     /// the GLIFF_VIDEO environment variable.
@@ -146,6 +153,7 @@ fn main() -> Result<()> {
             _ => session::CodecChoice::Auto,
         },
         pyrowave_bpp: cli.pyrowave_bpp.clamp(0.3, 8.0),
+        pyrowave_still_bpp: cli.pyrowave_still_bpp.clamp(0.0, 24.0),
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),

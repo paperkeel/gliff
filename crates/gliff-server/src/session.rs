@@ -46,6 +46,9 @@ pub struct Config {
     pub codec: CodecChoice,
     /// PyroWave's bits per pixel per frame at full rate (`--pyrowave-bpp`).
     pub pyrowave_bpp: f64,
+    /// PyroWave's bits per pixel for the sharp copy of a still screen
+    /// (`--pyrowave-still-bpp`); 0 sends none.
+    pub pyrowave_still_bpp: f64,
     pub video: VideoMode,
     /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
     pub full_chroma: bool,
@@ -330,6 +333,7 @@ where
         client_extent: (caps.max_width, caps.max_height),
         caps,
         max_stream: cfg.max_stream,
+        pyrowave_still_bpp: cfg.pyrowave_still_bpp,
         fps_limit: cfg.max_fps,
         max_fps: DEFAULT_FPS,
         link: LinkEstimator::new(),
@@ -539,6 +543,8 @@ struct Session {
     max_stream: Option<(u32, u32)>,
     /// The server's frame-rate limit (`--max-fps`).
     fps_limit: u32,
+    /// Bits per pixel for PyroWave's sharp still frame; 0 for none.
+    pyrowave_still_bpp: f64,
     /// The session-wide fps ceiling; ladder levels cap below it. It follows
     /// the refresh rate of the client's monitor within `fps_limit`.
     max_fps: u32,
@@ -607,6 +613,8 @@ const DEFAULT_FPS: u32 = 60;
 /// frame, at least this far apart.
 const MAX_REFINES: u8 = 8;
 const REFINE_EVERY: Duration = Duration::from_millis(200);
+/// How long a PyroWave screen stays still before its sharp copy goes out.
+const PYRO_STILL_AFTER: Duration = Duration::from_millis(80);
 /// A static screen produces no damage and so no first frame; after this
 /// long the capture is torn down and retried once with full damage.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
@@ -1032,21 +1040,43 @@ impl Session {
                     // Keep the frame: an idle link refines the still picture
                     // toward sharp, and a ladder step re-keyframes it at once.
                     self.last_frame = Some(frame);
-                    self.refines = 0;
-                    self.next_refine_at = now + REFINE_EVERY;
+                    self.refines =
+                        if self.sharp_still_budget().is_none() && self.codec == Codec::PyroWave {
+                            MAX_REFINES
+                        } else {
+                            0
+                        };
+                    self.next_refine_at = now + self.refine_delay();
                 }
             } else if now >= self.next_refine_at && self.refines < MAX_REFINES {
                 if let Some(frame) = self.last_frame.take() {
                     if self.matches_output(&frame) {
+                        // PyroWave codes every frame at the same budget, so a
+                        // plain re-encode gains nothing: send one copy of the
+                        // still screen at a near-lossless budget instead.
+                        let sharp = self.sharp_still_budget();
+                        if let (Some(bytes), VideoEncoder::Gpu(enc)) = (sharp, &mut self.encoder) {
+                            enc.set_next_frame_budget(bytes);
+                        }
                         // Re-encode the same buffer (import-cache hit) so a
                         // frame that arrived soft under a low budget
                         // converges to sharp while nothing changes on screen.
                         let Some(bytes) = self.encode_and_send(&frame, true)? else {
+                            // PyroWave fell back to H.264 on the same GPU: keep
+                            // the frame for a keyframe request on a still
+                            // screen. The CPU fallback drops it on purpose (it
+                            // cannot read a GPU buffer).
+                            if !self.require_shm {
+                                self.last_frame = Some(frame);
+                            }
                             return Ok(());
                         };
                         self.refines += 1;
-                        self.next_refine_at = now + REFINE_EVERY;
-                        if (bytes as f64) < self.refined_done_bytes() {
+                        self.next_refine_at = now + self.refine_delay();
+                        if sharp.is_some() {
+                            tracing::debug!(bytes, "sharp still frame");
+                            self.refines = MAX_REFINES;
+                        } else if (bytes as f64) < self.refined_done_bytes() {
                             // Converged: keep the frame for ladder steps,
                             // stop spending link on it.
                             self.refines = MAX_REFINES;
@@ -1107,6 +1137,25 @@ impl Session {
     /// fitted smaller.
     fn matches_output(&self, frame: &CapturedFrame) -> bool {
         frame.extent() == (self.output.width, self.output.height)
+    }
+
+    /// The byte budget of PyroWave's sharp still frame, or `None` (H.264, or
+    /// `--pyrowave-still-bpp 0`).
+    fn sharp_still_budget(&self) -> Option<usize> {
+        (self.codec == Codec::PyroWave && self.pyrowave_still_bpp > 0.0).then(|| {
+            (self.stream.0 as f64 * self.stream.1 as f64 * self.pyrowave_still_bpp / 8.0) as usize
+        })
+    }
+
+    /// How long the screen must stay still before a refinement pass:
+    /// shorter for PyroWave's single sharp frame, so text sharpens soon after
+    /// typing or scrolling stops.
+    fn refine_delay(&self) -> Duration {
+        if self.codec == Codec::PyroWave {
+            PYRO_STILL_AFTER
+        } else {
+            REFINE_EVERY
+        }
     }
 
     /// A refinement pass that codes below this many bytes changed nothing

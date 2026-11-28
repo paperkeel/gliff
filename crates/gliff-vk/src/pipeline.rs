@@ -166,6 +166,8 @@ pub struct Encoder {
     /// Imported capture buffers, keyed by the caller's buffer id.
     imports: HashMap<u64, Image>,
     settings: EncoderSettings,
+    /// A larger byte budget for the next PyroWave frame only.
+    next_budget: Option<usize>,
 }
 
 /// What turns a captured image into bytes.
@@ -222,6 +224,7 @@ impl Encoder {
             },
             imports: HashMap::new(),
             settings,
+            next_budget: None,
         })
     }
 
@@ -249,11 +252,18 @@ impl Encoder {
             },
             imports: HashMap::new(),
             settings,
+            next_budget: None,
         })
     }
 
     pub fn is_pyrowave(&self) -> bool {
         matches!(self.stage, EncodeStage::Pyro { .. })
+    }
+
+    /// Give the next PyroWave frame `bytes` instead of the bitrate's share,
+    /// as for a sharp copy of a still screen. H.264 ignores it.
+    pub fn set_next_frame_budget(&mut self, bytes: usize) {
+        self.next_budget = Some(bytes);
     }
 
     pub fn settings(&self) -> &EncoderSettings {
@@ -337,6 +347,7 @@ impl Encoder {
     ) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
         let t0 = std::time::Instant::now();
+        let next_budget = self.next_budget.take();
         let (split, main_stream, aux_stream) = match &mut self.stage {
             EncodeStage::H264 { split, main, aux } => (split, main, aux),
             EncodeStage::Pyro {
@@ -357,10 +368,12 @@ impl Encoder {
                 // The exact per-frame budget: the bitrate spread over the
                 // frame rate. The rate controller keeps it far above
                 // PyroWave's minimum (0.3 bits per pixel).
-                let budget = (u64::from(self.settings.bitrate)
-                    / u64::from(self.settings.framerate.max(1))
-                    / 8)
-                .max(1) as usize;
+                let budget = next_budget.unwrap_or(
+                    (u64::from(self.settings.bitrate)
+                        / u64::from(self.settings.framerate.max(1))
+                        / 8)
+                    .max(1) as usize,
+                );
                 let view = gliff_pyrowave::ImageView {
                     image: vk::Handle::as_raw(src.image),
                     width: src.width,
