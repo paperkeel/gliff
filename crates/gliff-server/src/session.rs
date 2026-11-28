@@ -1062,6 +1062,13 @@ impl Session {
                         // frame that arrived soft under a low budget
                         // converges to sharp while nothing changes on screen.
                         let Some(bytes) = self.encode_and_send(&frame, true)? else {
+                            // PyroWave fell back to H.264 on the same GPU: keep
+                            // the frame for a keyframe request on a still
+                            // screen. The CPU fallback drops it on purpose (it
+                            // cannot read a GPU buffer).
+                            if !self.require_shm {
+                                self.last_frame = Some(frame);
+                            }
                             return Ok(());
                         };
                         self.refines += 1;
