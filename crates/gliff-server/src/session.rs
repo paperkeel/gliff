@@ -968,6 +968,10 @@ impl Session {
                 }
                 self.pending = Some(image);
                 self.pending_since = Instant::now();
+                // A capture completes only on damage, and a request stays
+                // outstanding while sending is blocked, so arrivals follow
+                // the screen's change rate, not the link's.
+                self.note_change(self.pending_since);
                 self.capture_asked = false;
                 self.blocked_noted = false;
             }
@@ -1451,9 +1455,6 @@ impl Session {
         let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
-        if !app_limited {
-            self.note_change(t0);
-        }
         if let (Some(bytes), false, VideoEncoder::Gpu(enc)) = (
             self.pyrowave_change_budget(),
             app_limited,
