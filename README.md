@@ -159,7 +159,10 @@ choice, and `--pyrowave-bpp` trades sharpness for latency, because each
 frame must cross the link before it is shown. When the screen stops
 changing, the server sends one near-lossless copy 80 ms after the last frame
 (`--pyrowave-still-bpp`, 6 by default; 0 turns it off), so still text is
-crisp while motion keeps the lower budget. Both ends need
+crisp while motion keeps the lower budget. A screen that changes a few
+times a second (a blinking cursor, a clock, typing) is never still, so each
+frame also gets the link's bitrate spread over the measured change rate, up
+to that same near-lossless budget. Both ends need
 `libpyrowave-shared.so` (`scripts/build-pyrowave.sh`; the package installs
 it).
 

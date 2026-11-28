@@ -334,6 +334,8 @@ where
         caps,
         max_stream: cfg.max_stream,
         pyrowave_still_bpp: cfg.pyrowave_still_bpp,
+        change_interval: None,
+        last_change_at: None,
         fps_limit: cfg.max_fps,
         max_fps: DEFAULT_FPS,
         link: LinkEstimator::new(),
@@ -545,6 +547,10 @@ struct Session {
     fps_limit: u32,
     /// Bits per pixel for PyroWave's sharp still frame; 0 for none.
     pyrowave_still_bpp: f64,
+    /// Smoothed interval between frames that carried a change, for
+    /// PyroWave's per-frame budget; and when the last one went out.
+    change_interval: Option<Duration>,
+    last_change_at: Option<Instant>,
     /// The session-wide fps ceiling; ladder levels cap below it. It follows
     /// the refresh rate of the client's monitor within `fps_limit`.
     max_fps: u32,
@@ -962,6 +968,10 @@ impl Session {
                 }
                 self.pending = Some(image);
                 self.pending_since = Instant::now();
+                // A capture completes only on damage, and a request stays
+                // outstanding while sending is blocked, so arrivals follow
+                // the screen's change rate, not the link's.
+                self.note_change(self.pending_since);
                 self.capture_asked = false;
                 self.blocked_noted = false;
             }
@@ -1137,6 +1147,36 @@ impl Session {
     /// fitted smaller.
     fn matches_output(&self, frame: &CapturedFrame) -> bool {
         frame.extent() == (self.output.width, self.output.height)
+    }
+
+    /// Record a frame that carries a screen change, for the change rate.
+    fn note_change(&mut self, now: Instant) {
+        if let Some(last) = self.last_change_at {
+            let gap = now.duration_since(last).min(Duration::from_secs(1));
+            self.change_interval = Some(match self.change_interval {
+                Some(avg) => avg.mul_f64(0.7) + gap.mul_f64(0.3),
+                None => gap,
+            });
+        }
+        self.last_change_at = Some(now);
+    }
+
+    /// PyroWave sends every change as a whole frame, so its budget follows
+    /// how often the screen changes: the bitrate the link allows, spread
+    /// over the measured change rate instead of the fps ceiling. A screen
+    /// that changes a few times a second (a blinking cursor, a clock,
+    /// typing) gets near-lossless frames; full-rate motion keeps the motion
+    /// budget. `None` for H.264, or before the rate is known.
+    fn pyrowave_change_budget(&self) -> Option<usize> {
+        if self.codec != Codec::PyroWave {
+            return None;
+        }
+        let interval = self.change_interval?.as_secs_f64().max(1e-3);
+        let pixels = self.stream.0 as f64 * self.stream.1 as f64;
+        let motion = self.settings.bitrate as f64 / self.settings.framerate.max(1) as f64 / 8.0;
+        let most = (pixels * self.pyrowave_still_bpp / 8.0).max(motion);
+        let by_rate = self.ctl.target() as f64 * interval / 8.0;
+        Some(by_rate.clamp(motion, most) as usize)
     }
 
     /// The byte budget of PyroWave's sharp still frame, or `None` (H.264, or
@@ -1415,6 +1455,13 @@ impl Session {
         let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
+        if let (Some(bytes), false, VideoEncoder::Gpu(enc)) = (
+            self.pyrowave_change_budget(),
+            app_limited,
+            &mut self.encoder,
+        ) {
+            enc.set_next_frame_budget(bytes);
+        }
         let encoded = match self.encoder.encode(frame, self.stream, key) {
             Ok(e) => e,
             Err(e) if self.codec == Codec::PyroWave => {
